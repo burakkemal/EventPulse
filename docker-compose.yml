@@ -31,6 +31,30 @@ services:
       timeout: 3s
       retries: 5
 
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eventpulse-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Inside the Docker network, services are addressed by service name
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://eventpulse:eventpulse_dev@postgres:5432/eventpulse
+      HOST: 0.0.0.0
+      PORT: "3000"
+      NODE_ENV: development
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Bind-mount source for hot-reload during development
+      - ./src:/app/src:ro
+
 volumes:
   pgdata:
   redisdata:
