@@ -40,7 +40,6 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Inside the Docker network, services are addressed by service name
       REDIS_URL: redis://redis:6379
       DATABASE_URL: postgres://eventpulse:eventpulse_dev@postgres:5432/eventpulse
       HOST: 0.0.0.0
@@ -52,7 +51,27 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      # Bind-mount source for hot-reload during development
+      - ./src:/app/src:ro
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eventpulse-worker
+    restart: unless-stopped
+    # Override the default CMD to run the worker instead of the HTTP server
+    command: ["npm", "run", "dev:worker"]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://eventpulse:eventpulse_dev@postgres:5432/eventpulse
+      WORKER_ID: worker-1
+      NODE_ENV: development
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
       - ./src:/app/src:ro
 
 volumes:

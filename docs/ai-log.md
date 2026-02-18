@@ -161,3 +161,125 @@ docker compose ps
 curl -s http://localhost:3000/api/v1/events/health | jq .
 # Expected: { "status": "ok", "redis": "PONG" }
 ```
+
+---
+
+## Session 4 — Redis Stream Consumer + Postgres Persistence
+
+**Date:** 2026-02-18
+
+### Interaction Context (Provided to AI)
+
+- Phase 3: consume events from `events_stream` and persist to PostgreSQL.
+- Strict scope: XREADGROUP consumer → Drizzle insert → XACK.
+- Idempotent writes via `ON CONFLICT DO NOTHING` on `event_id` PK.
+- No rule engine, no dashboard, no advanced retry policies.
+
+### Interaction Summary
+
+Built the persistence layer as a standalone worker process, separate from the HTTP server:
+
+- **DB Schema** (`src/infrastructure/db/schema.ts`): Drizzle schema for `events` table — `event_id` (UUID) as PK, `event_type`, `source`, `timestamp`, `payload` (JSONB), `metadata` (JSONB), `created_at`.
+- **DB Client** (`src/infrastructure/db/client.ts`): Factory that returns both the raw `postgres.js` connection and typed Drizzle instance.
+- **Event Repository** (`src/infrastructure/db/event-repository.ts`): `insertEvent()` with `onConflictDoNothing` for idempotent inserts. Returns boolean indicating whether a row was actually inserted.
+- **Stream Consumer** (`src/infrastructure/worker/stream-consumer.ts`): XREADGROUP-based consumer loop with pending entry recovery, per-entry ACK-after-write semantics.
+- **Worker Bootstrap** (`src/worker.ts`): Standalone process with Redis + Postgres connections, `CREATE TABLE IF NOT EXISTS` for local dev auto-migration, and graceful SIGINT/SIGTERM shutdown.
+- **Drizzle Config** (`drizzle.config.ts`): Points drizzle-kit at the schema for `generate`/`migrate` commands.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Separate worker process** | Decouples ingestion throughput from persistence latency. HTTP server and worker can be scaled independently. Worker crashes don't affect API availability. |
+| **ACK-after-write** | Stream entry is only acknowledged after the Postgres insert succeeds (or confirms duplicate). On failure, the entry stays in the pending entries list (PEL) and is reprocessed on next startup via `XREADGROUP ... 0`. |
+| **Pending entry recovery** | On startup, the consumer reads its own PEL (`0` cursor) before switching to `>` for new messages. Handles crash recovery without data loss. |
+| **`CREATE TABLE IF NOT EXISTS` in worker** | Pragmatic choice for local dev — ensures the table exists on first `docker compose up` without requiring a separate migration step. Production would use `drizzle-kit migrate`. |
+| **`event_id` as natural PK** | Eliminates the need for a synthetic PK + uniqueness constraint. `ON CONFLICT DO NOTHING` on the PK gives us idempotency with zero extra indexes. |
+| **Shared Dockerfile, different CMD** | Worker reuses the same Docker image as the app. `docker-compose.yml` overrides `command` to run `npm run dev:worker`. Single image to build, two processes to run. |
+| **`BLOCK 5000` on XREADGROUP** | Blocks for 5s waiting for new messages, then loops. Balances responsiveness (sub-5s latency) against CPU idle cost. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/infrastructure/db/schema.ts` | New |
+| `src/infrastructure/db/client.ts` | New |
+| `src/infrastructure/db/event-repository.ts` | New |
+| `src/infrastructure/db/index.ts` | New |
+| `src/infrastructure/worker/stream-consumer.ts` | New |
+| `src/infrastructure/worker/index.ts` | New |
+| `src/worker.ts` | New |
+| `drizzle.config.ts` | New |
+| `src/infrastructure/index.ts` | Modified (added db + worker exports) |
+| `package.json` | Modified (added `dev:worker`, `start:worker` scripts) |
+| `docker-compose.yml` | Modified (added `worker` service) |
+
+### Validation Method
+```bash
+docker compose up -d --build
+docker compose ps
+# Expected: 4 services running (db, redis, app, worker)
+
+# Ingest an event
+curl -s -X POST http://localhost:3000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"page_view","source":"web","timestamp":"2026-02-18T12:00:00Z","payload":{"url":"/home"}}' | jq .
+
+# Check worker logs for "Event persisted"
+docker logs eventpulse-worker --tail 20
+
+# Verify row landed in Postgres
+docker exec eventpulse-db psql -U eventpulse -c "SELECT event_id, event_type, source FROM events;"
+
+# Idempotency test: re-send same event_id — should log "Duplicate event skipped"
+```
+### AI Corrections & Human Oversight -> ## Session 4
+
+The AI-generated implementation was reviewed and adjusted to align with
+production-oriented reliability guarantees and strict phase boundaries.
+
+Key human decisions:
+
+- **Consumer group lifecycle clarity**  
+  The AI did not explicitly document how the Redis consumer group is created.
+  I ensured the worker bootstraps the consumer group on startup (`XGROUP CREATE … MKSTREAM`)
+  and documented this behavior to avoid first-run failures.
+
+- **Consumer group start cursor (`0` → `$`)**  
+  The AI initially created the consumer group with a start ID of `0`, which forces
+  the group to read the entire historical stream on first initialization. While
+  useful for deliberate backfill scenarios, this is not a safe default for local
+  development or incremental rollouts.  
+  I changed the start cursor to `$` so the group begins from new messages only,
+  while still preserving crash recovery via pending-entry handling
+  (`XREADGROUP … 0` for recovery, then `>` for live traffic).
+
+- **Migration discipline**  
+  The AI added `CREATE TABLE IF NOT EXISTS` inside the worker.
+  I accepted this strictly for local development convenience, but clarified that
+  production environments must use explicit Drizzle migrations instead of implicit
+  schema creation at runtime.
+
+- **Pending entry recovery scope**  
+  The AI recovered only the worker’s own Pending Entries List (PEL).
+  I documented that cross-consumer reclamation (`XAUTOCLAIM`) is intentionally
+  deferred to the retry/DLQ phase to keep Phase 3 focused on persistence.
+
+- **Scope enforcement**  
+  I explicitly rejected any expansion into rule engine logic, dashboards,
+  or advanced retry orchestration to maintain strict adherence to the phase plan.
+
+These corrections ensure deterministic startup behavior, predictable recovery
+semantics, and alignment with the incremental system design strategy.
+
+---
+
+### Post-session corrections
+
+**File:** `src/infrastructure/worker/stream-consumer.ts`
+
+- `XGROUP CREATE` start cursor changed from `"0"` to `"$"` — prevents unintended full-stream historical replay on first boot.
+- Crash recovery is unaffected: `processPending()` still uses `XREADGROUP ... 0` to drain this consumer's pending entries list (PEL).
+- `"$"` controls the group's initial delivery offset; `"0"` in `XREADGROUP` controls per-consumer PEL replay. These are independent mechanisms.
+- Cross-consumer reclaim (`XAUTOCLAIM`) remains deferred to the retry/DLQ phase.
+- Classification: safety fix, not a functional change.
