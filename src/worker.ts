@@ -32,9 +32,9 @@ async function main(): Promise<void> {
   await redis.connect();
   log.info('Redis connected');
 
-  // Ensure the events table exists (lightweight migration via raw SQL).
+  // Ensure tables exist (lightweight migration via raw SQL).
   // In production this would be handled by drizzle-kit migrate,
-  // but for local dev this guarantees the table is present on first run.
+  // but for local dev this guarantees tables are present on first run.
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS events (
       event_id     UUID PRIMARY KEY,
@@ -46,7 +46,29 @@ async function main(): Promise<void> {
       created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     )
   `);
-  log.info('Database ready');
+
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS anomalies (
+      anomaly_id   UUID PRIMARY KEY,
+      event_id     UUID NOT NULL,
+      rule_id      VARCHAR(255) NOT NULL,
+      severity     VARCHAR(20)  NOT NULL,
+      message      VARCHAR(1024) NOT NULL,
+      detected_at  TIMESTAMPTZ  NOT NULL
+    )
+  `);
+
+  // Create indexes if they don't already exist
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_event_type ON events (event_type)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_source ON events (source)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events (timestamp)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_rule_id ON anomalies (rule_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_severity ON anomalies (severity)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_detected_at ON anomalies (detected_at)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_event_id ON anomalies (event_id)`);
+
+  log.info('Database ready (events + anomalies tables)');
 
   // Initialize rule engine with default rules
   const ruleRepo = new InMemoryRuleRepository();

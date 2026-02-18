@@ -3,7 +3,7 @@ import type { Logger } from 'pino';
 import type { Database } from '../db/index.js';
 import type { Rule } from '../../domain/rules/index.js';
 import type { EventWindow } from '../../application/rule-engine.js';
-import { insertEvent } from '../db/index.js';
+import { insertEvent, insertAnomaly } from '../db/index.js';
 import { evaluateEvent } from '../../application/rule-engine.js';
 
 const STREAM_KEY = 'events_stream';
@@ -231,6 +231,22 @@ async function processEntry(
           { anomaly },
           `Anomaly detected: [${anomaly.rule_id}] ${anomaly.message}`,
         );
+
+        // Persist anomaly to Postgres (best-effort, failure only logged)
+        try {
+          await insertAnomaly(deps.db, {
+            event_id: anomaly.event_id,
+            rule_id: anomaly.rule_id,
+            severity: anomaly.severity,
+            message: anomaly.message,
+            detected_at: anomaly.detected_at,
+          });
+        } catch (persistErr: unknown) {
+          deps.log.error(
+            { err: persistErr, anomaly_rule_id: anomaly.rule_id, event_id: event.event_id },
+            'Failed to persist anomaly',
+          );
+        }
       }
     } catch (err: unknown) {
       deps.log.error({ err, event_id: event.event_id, streamId }, 'Failed to evaluate rules');

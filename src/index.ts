@@ -1,13 +1,13 @@
 import Fastify from 'fastify';
-import { redisPlugin } from './infrastructure/index.js';
-import { eventRoutes } from './interfaces/http/index.js';
+import { redisPlugin, dbPlugin } from './infrastructure/index.js';
+import { eventRoutes, queryRoutes } from './interfaces/http/index.js';
 
 /**
  * Bootstrap the Fastify server.
  *
  * Plugin registration order matters:
- *   1. Infrastructure (Redis) — so downstream plugins can depend on it.
- *   2. HTTP routes — decorated with `dependencies: ['redis']`.
+ *   1. Infrastructure (Redis, Database) — so downstream plugins can depend on them.
+ *   2. HTTP routes — decorated with `dependencies: ['redis']` or `dependencies: ['db']`.
  */
 async function main(): Promise<void> {
   const fastify = Fastify({
@@ -18,9 +18,11 @@ async function main(): Promise<void> {
 
   // --- Infrastructure ---
   await fastify.register(redisPlugin);
+  await fastify.register(dbPlugin);
 
   // --- HTTP Interface ---
   await fastify.register(eventRoutes);
+  await fastify.register(queryRoutes);
 
   // --- Start ---
   const host = process.env['HOST'] ?? '0.0.0.0';

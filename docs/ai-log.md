@@ -420,3 +420,110 @@ docker compose up -d --build
 docker exec eventpulse-app npm test
 docker exec eventpulse-app npm run test:coverage
 ```
+
+---
+
+## Session 6 — Query API (Read-only Endpoints)
+
+**Date:** 2026-02-18
+
+### Interaction Context (Provided to AI)
+
+- Phase 5 of the EventPulse senior backend case study.
+- Scope: read-only query endpoints over existing Postgres data. No mutations, no new ingestion paths.
+- Required endpoints: `GET /api/v1/events` (paginated + filtered), `GET /api/v1/events/:event_id` (404 handling), `GET /api/v1/anomalies` (paginated + filtered).
+- If anomalies are not persisted yet: create the `anomalies` table, minimal schema, no migrations framework overhaul.
+- Clean Architecture: no cross-layer shortcuts.
+- Indexed queries: add indexes for all filterable columns.
+
+### Interaction Summary
+
+Built the complete query API layer and wired anomaly persistence into the worker:
+
+- **DB Schema** (`src/infrastructure/db/schema.ts`): Added `anomalies` table (anomaly_id, event_id, rule_id, severity, message, detected_at). Added indexes on both tables for all filterable columns.
+- **Anomaly Repository** (`src/infrastructure/db/anomaly-repository.ts`): `insertAnomaly()` — generates UUID, inserts into anomalies table.
+- **Event Query Repository** (`src/infrastructure/db/event-query-repository.ts`): `queryEvents()` with dynamic WHERE clauses (event_type, source, from/to date range) + limit/offset pagination. `findEventById()` for single-event lookup.
+- **Anomaly Query Repository** (`src/infrastructure/db/anomaly-query-repository.ts`): `queryAnomalies()` with rule_id/severity filters + pagination.
+- **DB Fastify Plugin** (`src/infrastructure/db/db-plugin.ts`): Manages Drizzle/postgres.js lifecycle for the HTTP server. Decorates `fastify.db`, closes pool on shutdown. Declared as `name: 'db'` for dependency resolution.
+- **Query Use Cases** (`src/application/query-events.ts`, `src/application/query-anomalies.ts`): Thin application-layer functions that sanitize pagination params (clamp limit to 1–100, floor offset to 0) and delegate to repositories. Return `{ data, pagination }` envelopes.
+- **Query Routes** (`src/interfaces/http/query-routes.ts`): Three endpoints registered via `fastify-plugin` with `dependencies: ['db']`.
+- **Server Wiring** (`src/index.ts`): Registered `dbPlugin` before `queryRoutes` in the plugin chain alongside existing `redisPlugin` and `eventRoutes`.
+- **Worker Anomaly Persistence** (`src/infrastructure/worker/stream-consumer.ts`): After rule evaluation, detected anomalies are now persisted to Postgres via `insertAnomaly()`. Persistence is best-effort — failure is logged but never blocks the consumer loop.
+- **Worker Table Creation** (`src/worker.ts`): `CREATE TABLE IF NOT EXISTS` block now includes the `anomalies` table and `CREATE INDEX IF NOT EXISTS` for all filterable columns on both tables.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Separate DB plugin for HTTP server** | The worker manages its own connection via `createDbClient()`. The HTTP server needs a Fastify-managed lifecycle plugin that decorates `fastify.db` and closes the pool on shutdown. Keeps connection ownership clear. |
+| **Pagination clamping (1–100)** | Prevents unbounded queries. Default limit of 20, max of 100. Offset floored to 0. Applied in the application layer, not the route handler, so the invariant holds for any future caller. |
+| **Dynamic WHERE clause building** | Query repositories build Drizzle `and()` conditions only for provided filters. No filter = no WHERE clause. Avoids N separate query functions for each filter combination. |
+| **Best-effort anomaly persistence** | Anomaly insert failures are caught and logged independently per anomaly. A single failed insert doesn't skip remaining anomalies or block the consumer. Consistent with the post-ACK rule evaluation pattern. |
+| **Indexes on all filterable columns** | `event_type`, `source`, `timestamp`, `created_at` on events; `rule_id`, `severity`, `detected_at`, `event_id` on anomalies. Covers all query API filter paths. |
+| **`dependencies: ['db']` on query routes** | Fastify-plugin dependency declaration ensures `fastify.db` exists before any query route handler executes. Same pattern as `event-routes` depending on `redis`. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/infrastructure/db/schema.ts` | Modified (added anomalies table + indexes) |
+| `src/infrastructure/db/anomaly-repository.ts` | New |
+| `src/infrastructure/db/event-query-repository.ts` | New |
+| `src/infrastructure/db/anomaly-query-repository.ts` | New |
+| `src/infrastructure/db/db-plugin.ts` | New |
+| `src/infrastructure/db/index.ts` | Modified (added new exports) |
+| `src/application/query-events.ts` | New |
+| `src/application/query-anomalies.ts` | New |
+| `src/application/index.ts` | Modified (added query use case exports) |
+| `src/interfaces/http/query-routes.ts` | New |
+| `src/interfaces/http/index.ts` | Modified (added queryRoutes export) |
+| `src/infrastructure/index.ts` | Modified (added dbPlugin export) |
+| `src/index.ts` | Modified (registered dbPlugin + queryRoutes) |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (anomaly persistence via insertAnomaly) |
+| `src/worker.ts` | Modified (CREATE TABLE for anomalies + indexes) |
+
+### Validation Method
+```bash
+docker compose up -d --build
+
+# Verify query endpoints respond
+curl -s http://localhost:3000/api/v1/events | jq .
+# Expected: { "data": [...], "pagination": { "limit": 20, "offset": 0, "count": N } }
+
+curl -s http://localhost:3000/api/v1/events?event_type=page_view&limit=5 | jq .
+# Expected: filtered results with max 5 items
+
+curl -s "http://localhost:3000/api/v1/events/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" | jq .
+# Expected: single event or { "error": "Event not found" } with 404
+
+curl -s http://localhost:3000/api/v1/anomalies | jq .
+# Expected: { "data": [...], "pagination": { ... } }
+
+curl -s http://localhost:3000/api/v1/anomalies?severity=medium | jq .
+# Expected: anomalies filtered by severity
+
+# Verify anomalies are persisted (send event that triggers a rule, then query)
+curl -s -X POST http://localhost:3000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"page_view","source":"web","timestamp":"2026-02-18T12:00:00Z","payload":{}}' | jq .
+# Wait 2-3s for worker to process
+sleep 3
+curl -s http://localhost:3000/api/v1/anomalies | jq .
+# Expected: anomaly with rule_id "invalid-payload" should appear
+
+# Verify directly in Postgres
+docker exec eventpulse-db psql -U eventpulse -c "SELECT COUNT(*) FROM anomalies;"
+docker exec eventpulse-db psql -U eventpulse -c "\di"  # List indexes
+```
+
+### AI Corrections / Fixes
+
+**File:** `src/interfaces/http/query-routes.ts`
+
+Two edge-case bugs were identified in the query route handlers:
+
+- **NaN bypass on `limit`/`offset`:** `Number('abc')` produces `NaN`, and `Math.min(Math.max(NaN, 1), 500)` evaluates to `NaN`, which bypasses the application-layer clamp and breaks Drizzle's `limit()`/`offset()` calls. Added a `safeInt()` helper that returns `undefined` for missing values and `NaN` for non-integer strings. Both `/api/v1/events` and `/api/v1/anomalies` handlers now check for `NaN` and return `400` with a descriptive error before reaching the use case layer.
+
+- **Unvalidated `from`/`to` timestamps:** Invalid ISO strings (e.g., `from=not-a-date`) were passed straight to the query repository, producing invalid SQL `WHERE timestamp >= 'Invalid Date'`. Added `isValidIso()` guard using `Date.parse()` — returns `400` if either value is unparseable. Also rejects `from > to` with a `400` to prevent empty-by-definition queries from reaching the database.
+
+Both fixes are contained in the route handler layer. No changes to the application use cases or query repositories.
