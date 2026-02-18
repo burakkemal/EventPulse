@@ -283,3 +283,27 @@ semantics, and alignment with the incremental system design strategy.
 - `"$"` controls the group's initial delivery offset; `"0"` in `XREADGROUP` controls per-consumer PEL replay. These are independent mechanisms.
 - Cross-consumer reclaim (`XAUTOCLAIM`) remains deferred to the retry/DLQ phase.
 - Classification: safety fix, not a functional change.
+
+
+### Validation Results (Local) Sessions 2–4 (Local)
+
+- **Ingestion (API)**
+  - `POST /api/v1/events` returned `202 Accepted` with generated `event_id`.
+  - `GET /api/v1/events/health` returned `{ "status": "ok", "redis": "PONG" }`.
+
+- **Persistence (Worker → Postgres)**
+  - Verified events were persisted to Postgres via:
+    - `SELECT event_id, event_type, source FROM events ORDER BY created_at DESC LIMIT 5;`
+
+- **Idempotency**
+  - Re-sent the same `event_id` twice and confirmed only one row exists:
+    - `event_id = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`
+    - `COUNT(*) = 1`
+
+- **Reliability (No event loss)**
+  - Stopped `eventpulse-worker`, ingested events (all `202`), restarted worker, and confirmed persisted row count matched the ingested count.
+
+- **Performance (k6)**
+  - 100 events/sec sustained for 60s (`6000` requests total)
+  - `p95 = 2ms` and `http_req_failed = 0.00%`
+  - Thresholds satisfied: p95 `< 200ms`, failures `< 1%`.
