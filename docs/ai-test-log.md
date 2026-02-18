@@ -55,11 +55,56 @@ All test and validation artifacts created/updated with AI assistance across Sess
 | `tests/k6/ingestion_p95_100eps.js` | 2 | k6 load test — p95 < 200ms @ 100 eps for 60s |
 | `docs/runbooks/no-event-loss.md` | 3 | Reliability NFR runbook — event buffering and recovery |
 | `docs/validation.md` | 1–3 | Consolidated validation guide for all phases |
+| `tests/application/query-events.test.ts` | 6 | Unit tests for listEvents + getEvent use cases (15 tests) |
+| `tests/application/query-anomalies.test.ts` | 6 | Unit tests for listAnomalies use case (12 tests) |
 
 **Runbook corrections applied:** consumer group pre-step (1a), constants table with source references, PowerShell ingestion loop, jq-free alternatives, updated pass/fail criteria.
 
 **All assets:** AI-generated, manually reviewed, no application logic changes.
 
+
+## 2026-02-18 — Query use-case unit tests (Session 6)
+
+**Files:**
+- `tests/application/query-events.test.ts`
+- `tests/application/query-anomalies.test.ts`
+
+**Purpose:** Unit tests for the application-layer query use cases (`listEvents`, `getEvent`, `listAnomalies`). Infrastructure DB functions are mocked via `vi.mock` (ESM-safe hoisted pattern) — no Docker, Redis, or Postgres required.
+
+**Behaviors covered:**
+
+`query-events.test.ts` (15 tests):
+- Default pagination: `limit=50`, `offset=0` when params omitted
+- Limit clamping: `0→1`, `9999→500`, `-5→1`, valid passthrough
+- Offset clamping: `-10→0`, valid passthrough
+- Filter pass-through: `event_type`, `source`, `from`/`to` included only when provided; omitted when absent; multiple filters simultaneously
+- Return shape: `{ data, pagination: { limit, offset, count } }` with `count === data.length`; empty result returns `count=0`
+- `getEvent`: returns row when found, returns `null` when `findEventById` returns `undefined`
+
+`query-anomalies.test.ts` (12 tests):
+- Default pagination: `limit=50`, `offset=0` when params omitted
+- Limit clamping: `0→1`, `9999→500`, `-3→1`, valid passthrough
+- Offset clamping: `-10→0`, valid passthrough
+- Filter pass-through: `rule_id`, `severity` included only when provided; both filters; omitted when absent
+- Return shape: `{ data, pagination }` with `count === data.length`; empty result
+
+**Config change:** `vitest.config.ts` — added `src/application/query-events.ts` and `src/application/query-anomalies.ts` to coverage `include` array. Existing rule-engine coverage targets unchanged.
+
+**Run:**
+```bash
+# All tests (inside container)
+docker exec eventpulse-app npm test
+
+# With coverage
+docker exec eventpulse-app npm run test:coverage
+
+# Only query use-case tests (local or container)
+npx vitest run tests/application/
+```
+
+**Note:** AI-generated, manually reviewed, no application logic changes.
+
+---
 
 ## Manual Test Execution — Sessions 2–4 (Local)
 
