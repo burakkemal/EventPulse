@@ -1,7 +1,10 @@
 import type Redis from 'ioredis';
 import type { Logger } from 'pino';
 import type { Database } from '../db/index.js';
+import type { Rule } from '../../domain/rules/index.js';
+import type { EventWindow } from '../../application/rule-engine.js';
 import { insertEvent } from '../db/index.js';
+import { evaluateEvent } from '../../application/rule-engine.js';
 
 const STREAM_KEY = 'events_stream';
 const GROUP_NAME = 'event_persister';
@@ -75,12 +78,25 @@ function parseStreamEntry(fields: string[]): {
   };
 }
 
+/** Dependencies bundled for internal functions. */
+interface ConsumerDeps {
+  redis: Redis;
+  db: Database;
+  log: Logger;
+  rules: readonly Rule[];
+  window: EventWindow;
+}
+
 /**
  * Main consumer loop.
  *
  * 1. XREADGROUP with BLOCK — waits for new messages on the stream.
- * 2. For each message: parse → insert into Postgres (idempotent).
- * 3. XACK only after successful DB write.
+ * 2. For each message: parse → insert into Postgres (idempotent) → XACK.
+ * 3. After successful persist+ACK, evaluate rules → log anomalies.
+ *
+ * Rule evaluation is intentionally post-ACK: rules must never block
+ * persistence or cause re-delivery. A rule failure is logged but
+ * the event is already safely committed and acknowledged.
  *
  * On insert failure the message is NOT acknowledged, so Redis will
  * re-deliver it on the next read cycle (pending entries list).
@@ -92,16 +108,28 @@ export async function startConsumer(
   db: Database,
   log: Logger,
   signal: AbortSignal,
+  rules: readonly Rule[] = [],
+  window?: EventWindow,
 ): Promise<void> {
+  // Import EventWindow lazily to avoid circular deps in tests
+  const { EventWindow: EW } = await import('../../application/rule-engine.js');
+  const deps: ConsumerDeps = {
+    redis,
+    db,
+    log,
+    rules,
+    window: window ?? new EW(),
+  };
+
   await ensureConsumerGroup(redis, log);
 
   log.info(
-    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY },
+    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY, ruleCount: rules.length },
     'Consumer started',
   );
 
   // First, claim any pending messages from previous crashes
-  await processPending(redis, db, log);
+  await processPending(deps);
 
   while (!signal.aborted) {
     try {
@@ -118,7 +146,7 @@ export async function startConsumer(
 
       for (const [, entries] of response) {
         for (const [streamId, fields] of entries) {
-          await processEntry(redis, db, log, streamId, fields);
+          await processEntry(deps, streamId, fields);
         }
       }
     } catch (err: unknown) {
@@ -135,11 +163,11 @@ export async function startConsumer(
  * Processes pending (previously delivered but unacknowledged) entries.
  * This handles recovery after a crash or restart.
  */
-async function processPending(redis: Redis, db: Database, log: Logger): Promise<void> {
-  log.info('Checking for pending entries...');
+async function processPending(deps: ConsumerDeps): Promise<void> {
+  deps.log.info('Checking for pending entries...');
 
   // Read pending entries (delivered but not ACKed)
-  const response = await redis.xreadgroup(
+  const response = await deps.redis.xreadgroup(
     'GROUP', GROUP_NAME, CONSUMER_NAME,
     'COUNT', BATCH_SIZE,
     'STREAMS', STREAM_KEY,
@@ -152,42 +180,61 @@ async function processPending(redis: Redis, db: Database, log: Logger): Promise<
   for (const [, entries] of response) {
     for (const [streamId, fields] of entries) {
       if (fields.length === 0) continue; // already acked, skip nil entries
-      await processEntry(redis, db, log, streamId, fields);
+      await processEntry(deps, streamId, fields);
       count++;
     }
   }
 
   if (count > 0) {
-    log.info({ count }, 'Recovered pending entries');
+    deps.log.info({ count }, 'Recovered pending entries');
   }
 }
 
 /**
- * Processes a single stream entry: parse → insert → ACK.
+ * Processes a single stream entry: parse → insert → ACK → evaluate rules.
+ *
+ * Persistence and rule evaluation have separate error boundaries.
+ * A rule failure must never masquerade as a persistence failure or
+ * prevent acknowledgment.
  */
 async function processEntry(
-  redis: Redis,
-  db: Database,
-  log: Logger,
+  deps: ConsumerDeps,
   streamId: string,
   fields: string[],
 ): Promise<void> {
   const event = parseStreamEntry(fields);
 
+  // --- Persistence boundary: insert + ACK ---
   try {
-    const inserted = await insertEvent(db, event);
+    const inserted = await insertEvent(deps.db, event);
 
     // ACK only after successful write (or confirmed duplicate)
-    await redis.xack(STREAM_KEY, GROUP_NAME, streamId);
+    await deps.redis.xack(STREAM_KEY, GROUP_NAME, streamId);
 
     if (inserted) {
-      log.debug({ event_id: event.event_id, streamId }, 'Event persisted');
+      deps.log.debug({ event_id: event.event_id, streamId }, 'Event persisted');
     } else {
-      log.debug({ event_id: event.event_id, streamId }, 'Duplicate event skipped');
+      deps.log.debug({ event_id: event.event_id, streamId }, 'Duplicate event skipped');
     }
   } catch (err: unknown) {
     // Do NOT ack — message stays in pending list for redelivery
-    log.error({ err, event_id: event.event_id, streamId }, 'Failed to persist event');
+    deps.log.error({ err, event_id: event.event_id, streamId }, 'Failed to persist event');
+    return; // Skip rule evaluation — event was not committed
+  }
+
+  // --- Rule evaluation boundary (post-ACK, never blocks persistence) ---
+  if (deps.rules.length > 0) {
+    try {
+      const { anomalies } = evaluateEvent(event, deps.rules, deps.window);
+      for (const anomaly of anomalies) {
+        deps.log.warn(
+          { anomaly },
+          `Anomaly detected: [${anomaly.rule_id}] ${anomaly.message}`,
+        );
+      }
+    } catch (err: unknown) {
+      deps.log.error({ err, event_id: event.event_id, streamId }, 'Failed to evaluate rules');
+    }
   }
 }
 

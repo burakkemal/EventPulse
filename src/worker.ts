@@ -2,6 +2,8 @@ import Redis from 'ioredis';
 import pino from 'pino';
 import { createDbClient } from './infrastructure/db/index.js';
 import { startConsumer } from './infrastructure/worker/index.js';
+import { InMemoryRuleRepository } from './infrastructure/rules/index.js';
+import { EventWindow } from './application/rule-engine.js';
 
 /**
  * Standalone worker process that consumes events from Redis Streams
@@ -46,7 +48,13 @@ async function main(): Promise<void> {
   `);
   log.info('Database ready');
 
-  await startConsumer(redis, db, log, ac.signal);
+  // Initialize rule engine with default rules
+  const ruleRepo = new InMemoryRuleRepository();
+  const rules = ruleRepo.getAll();
+  const eventWindow = new EventWindow();
+  log.info({ ruleCount: rules.length, ruleIds: rules.map((r) => r.id) }, 'Rules loaded');
+
+  await startConsumer(redis, db, log, ac.signal, rules, eventWindow);
 }
 
 // Graceful shutdown on SIGINT / SIGTERM

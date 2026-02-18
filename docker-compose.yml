@@ -51,7 +51,10 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./src:/app/src:ro
+      # Full repo mount — makes tests, configs, docs visible inside container
+      - .:/app
+      # Named volume masks host node_modules, preserves container's npm install
+      - app_node_modules:/app/node_modules
 
   worker:
     build:
@@ -59,7 +62,6 @@ services:
       dockerfile: Dockerfile
     container_name: eventpulse-worker
     restart: unless-stopped
-    # Override the default CMD to run the worker instead of the HTTP server
     command: ["npm", "run", "dev:worker"]
     environment:
       REDIS_URL: redis://redis:6379
@@ -72,8 +74,12 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./src:/app/src:ro
+      # Same strategy as app — full repo + preserved node_modules
+      - .:/app
+      - worker_node_modules:/app/node_modules
 
 volumes:
   pgdata:
   redisdata:
+  app_node_modules:
+  worker_node_modules:

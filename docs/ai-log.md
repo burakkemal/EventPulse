@@ -307,3 +307,116 @@ semantics, and alignment with the incremental system design strategy.
   - 100 events/sec sustained for 60s (`6000` requests total)
   - `p95 = 2ms` and `http_req_failed = 0.00%`
   - Thresholds satisfied: p95 `< 200ms`, failures `< 1%`.
+
+---
+
+## Session 5 — Rule Engine + Anomaly Detection
+
+**Date:** 2026-02-18
+
+### Interaction Context (Provided to AI)
+
+- Phase 4 of the EventPulse senior backend case study.
+- Scope: domain rule types, rule engine, three starter rules, in-memory rule repository, unit tests.
+- Rules must be pure, deterministic, unit-testable functions.
+- No persistence of anomalies — log only.
+- Coverage target: >80%.
+
+### Interaction Summary
+
+Built the anomaly detection layer across domain, application, and infrastructure:
+
+- **Domain types** (`src/domain/rules/types.ts`): `Rule`, `RuleResult`, `RuleContext`, `Anomaly`, `Severity`. Rules are defined as interfaces with a pure `evaluate()` method.
+- **Three starter rules** (`src/domain/rules/`):
+  - `rate-spike.ts`: Triggers when >N events from the same source within T seconds. Uses context window.
+  - `invalid-payload.ts`: Triggers when known event types are missing required payload fields. Configurable field map.
+  - `timestamp-drift.ts`: Triggers when event timestamp deviates >N seconds from server time. Injectable clock for testability.
+- **Rule engine** (`src/application/rule-engine.ts`): `evaluateEvent()` orchestrator + `EventWindow` sliding window for source-scoped context. Adds event to window after evaluation to prevent double-counting.
+- **In-memory rule repository** (`src/infrastructure/rules/in-memory-rule-repo.ts`): Temporary stub with default rule set. Supports runtime add/replace.
+- **Worker integration**: `startConsumer()` now accepts rules + window. After persist+ACK, evaluates rules and logs anomalies via `log.warn()` with structured output.
+- **Unit tests** (`tests/rules/`): 5 test files, 33 test cases covering all rules, the engine, the window, and the repository. Edge cases include boundary thresholds, unparseable timestamps, null values, custom parameters, and empty contexts.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Vitest over Jest** | Native ESM support (no `experimental-vm-modules`), TypeScript via esbuild out of the box, same `expect` API. Avoids `ts-jest`/`@swc/jest` transform overhead. |
+| **Injectable `nowFn` on timestamp drift** | Makes the rule fully deterministic in tests without mocking `Date.now()` globally. Same pattern used by production-grade rule engines. |
+| **`EventWindow` as explicit dependency** | Not hidden inside the engine — passed in by the caller. Makes the window lifetime controllable and testable. |
+| **`evaluateEvent` adds to window AFTER evaluation** | Prevents the current event from appearing in its own context (double-counting in rate-spike). |
+| **Rules run after persist+ACK** | Rule evaluation never blocks persistence or acknowledgment. If rules throw, the event is already safely in Postgres. |
+| **`ConsumerDeps` bundle** | Internal refactor of `processEntry`/`processPending` to take a deps object instead of 5+ positional args. No public API change to `startConsumer()`. |
+| **Coverage scoped to rule code** | `vitest.config.ts` targets only `src/domain/rules/**`, `src/application/rule-engine.ts`, and `src/infrastructure/rules/**` — avoids measuring infrastructure code that requires integration tests. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/domain/rules/types.ts` | New |
+| `src/domain/rules/rate-spike.ts` | New |
+| `src/domain/rules/invalid-payload.ts` | New |
+| `src/domain/rules/timestamp-drift.ts` | New |
+| `src/domain/rules/index.ts` | New |
+| `src/application/rule-engine.ts` | New |
+| `src/infrastructure/rules/in-memory-rule-repo.ts` | New |
+| `src/infrastructure/rules/index.ts` | New |
+| `tests/rules/helpers.ts` | New |
+| `tests/rules/rate-spike.test.ts` | New |
+| `tests/rules/invalid-payload.test.ts` | New |
+| `tests/rules/timestamp-drift.test.ts` | New |
+| `tests/rules/rule-engine.test.ts` | New |
+| `tests/rules/in-memory-rule-repo.test.ts` | New |
+| `vitest.config.ts` | New |
+| `src/domain/index.ts` | Modified (added rule exports) |
+| `src/application/index.ts` | Modified (added engine exports) |
+| `src/infrastructure/index.ts` | Modified (added rule repo export) |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (accepts rules + window, evaluates after persist) |
+| `src/worker.ts` | Modified (initializes rule repo + window, passes to consumer) |
+| `package.json` | Modified (added vitest, coverage, test scripts) |
+
+### Validation Method
+```bash
+# After npm install
+npm test
+# Expected: 33 tests pass across 5 suites
+
+npm run test:coverage
+# Expected: >80% coverage on lines, functions, branches, statements
+# Scoped to: src/domain/rules/**, src/application/rule-engine.ts, src/infrastructure/rules/**
+
+# Verify anomaly logging in running system
+docker compose up -d --build
+# Send an event with missing payload fields
+curl -s -X POST http://localhost:3000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"page_view","source":"web","timestamp":"2026-02-18T12:00:00Z","payload":{}}' | jq .
+# Check worker logs for "Anomaly detected: [invalid-payload]"
+docker logs eventpulse-worker --tail 10
+```
+
+### AI Corrections / Fixes
+
+**File:** `src/infrastructure/worker/stream-consumer.ts`
+
+- **Comment-order mismatch:** The `startConsumer` docblock stated "insert → evaluate → ACK" but actual code order is insert → ACK → evaluate. Updated both the `startConsumer` and `processEntry` docblocks to reflect the real order and document the design intent (rules are post-ACK, must never block persistence).
+- **Split error handling:** `processEntry` had a single `try/catch` covering both persistence and rule evaluation. A thrown rule would log "Failed to persist event" — a misleading message, since the insert+ACK may have already succeeded. Refactored into two separate error boundaries: persistence failures prevent ACK and skip rules (early return); rule failures are caught independently and logged as "Failed to evaluate rules" with `event_id` and `streamId`. No change to persistence or ACK semantics.
+
+### AI Corrections / Infrastructure Fixes
+
+**Problem:** Tests, `vitest.config.ts`, and `docs/` were invisible inside the app and worker containers because only `./src` was bind-mounted to `/app/src`. Mounting the full repo root (`.:/app`) would shadow the container's `/app/node_modules` with the host directory, losing the Vitest binary and all installed dependencies.
+
+**Fix (3 files, zero application logic changes):**
+
+- **`docker-compose.yml`:** Changed both `app` and `worker` volume mounts from `./src:/app/src:ro` to two entries: `.:/app` (full repo bind mount) + a named volume for `node_modules` (`app_node_modules:/app/node_modules`, `worker_node_modules:/app/node_modules`). Added `app_node_modules` and `worker_node_modules` to the `volumes:` section.
+- **`Dockerfile`:** Changed `COPY tsconfig.json` + `COPY src/` to `COPY . .` so all project files (tests, configs, docs) are baked into the image. The `.dockerignore` still excludes `node_modules` and `dist`.
+
+**Why the named volume trick works:** Docker evaluates volume mounts in order. The bind mount `.:/app` overlays the host repo onto `/app`, including an empty (or platform-mismatched) `node_modules/`. The named volume `app_node_modules:/app/node_modules` then masks that specific subdirectory with a persistent Docker volume. On first `docker compose up --build`, Docker populates this volume from the image's `/app/node_modules` (installed during `RUN npm install`). On subsequent runs the volume persists, so deps survive container recreation without re-install.
+
+**Preserved behaviors:** Hot-reload via tsx watch (file changes on host propagate instantly through the bind mount), `npm test` and `npm run test:coverage` now work inside the container, and `node_modules` stays Linux-native regardless of host OS.
+
+**Validation:**
+```bash
+docker compose up -d --build
+docker exec eventpulse-app npm test
+docker exec eventpulse-app npm run test:coverage
+```

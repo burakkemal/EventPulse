@@ -6,9 +6,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install
 
-# Copy source
-COPY tsconfig.json ./
-COPY src/ ./src/
+# Copy all project files (tests, configs, source)
+COPY . .
 
 # Start in dev mode (tsx watch for hot-reload)
 CMD ["npm", "run", "dev"]
