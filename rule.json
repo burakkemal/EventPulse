@@ -1,0 +1,1 @@
+{  "name":"Error burst",  "severity":"critical",  "window_seconds":60,  "cooldown_seconds":0,  "condition":{    "type":"threshold",    "metric":"count",    "filters":{"event_type":"error","source":"payment_service"},    "operator":">",    "value":3  }} 

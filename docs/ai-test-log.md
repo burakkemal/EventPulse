@@ -57,6 +57,8 @@ All test and validation artifacts created/updated with AI assistance across Sess
 | `docs/validation.md` | 1–3 | Consolidated validation guide for all phases |
 | `tests/application/query-events.test.ts` | 6 | Unit tests for listEvents + getEvent use cases (15 tests) |
 | `tests/application/query-anomalies.test.ts` | 6 | Unit tests for listAnomalies use case (12 tests) |
+| `tests/application/rule-crud.test.ts` | 7 | Unit tests for rule CRUD use cases (11 tests) |
+| `tests/application/threshold-evaluator.test.ts` | 7 | Unit tests for ThresholdEvaluator (23 tests) |
 
 **Runbook corrections applied:** consumer group pre-step (1a), constants table with source references, PowerShell ingestion loop, jq-free alternatives, updated pass/fail criteria.
 

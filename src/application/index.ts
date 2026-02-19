@@ -5,3 +5,8 @@ export { listEvents, getEvent } from './query-events.js';
 export type { ListEventsParams } from './query-events.js';
 export { listAnomalies } from './query-anomalies.js';
 export type { ListAnomaliesParams } from './query-anomalies.js';
+export { createRuleSchema, updateRuleSchema, patchRuleSchema, thresholdConditionSchema } from './rule-schema.js';
+export type { ThresholdCondition, RuleSeverity, CreateRuleInput, UpdateRuleInput, PatchRuleInput } from './rule-schema.js';
+export { createRule, listRules, getRule, updateRuleFull, patchRulePartial, removeRule } from './rule-crud.js';
+export { ThresholdEvaluator } from './threshold-evaluator.js';
+export type { ThresholdAnomaly, EvaluatableEvent } from './threshold-evaluator.js';

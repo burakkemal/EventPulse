@@ -527,3 +527,175 @@ Two edge-case bugs were identified in the query route handlers:
 - **Unvalidated `from`/`to` timestamps:** Invalid ISO strings (e.g., `from=not-a-date`) were passed straight to the query repository, producing invalid SQL `WHERE timestamp >= 'Invalid Date'`. Added `isValidIso()` guard using `Date.parse()` — returns `400` if either value is unparseable. Also rejects `from > to` with a `400` to prevent empty-by-definition queries from reaching the database.
 
 Both fixes are contained in the route handler layer. No changes to the application use cases or query repositories.
+
+---
+
+## Session 7 — Rule Storage + CRUD (P0)
+
+**Date:** 2026-02-19
+
+### Interaction Context (Provided to AI)
+
+- Phase 7 of the EventPulse senior backend case study.
+- Scope: DB-backed rule storage, CRUD API, threshold-based aggregation evaluation.
+- Rules must come only from Postgres — no in-memory defaults at runtime.
+- `InMemoryRuleRepository` retained only for existing unit tests.
+- Threshold condition format: `{ type: "threshold", metric: "count", filters, operator, value }`.
+- XACK order changed to: DB write → evaluate → anomaly persist → XACK.
+- Preserve existing ingestion, persistence, and test behavior.
+
+### Interaction Summary
+
+Built the complete rule management and threshold evaluation system:
+
+- **DB Schema** (`src/infrastructure/db/schema.ts`): Added `rules` table (rule_id UUID PK, name, enabled, severity, window_seconds, cooldown_seconds, condition JSONB, created_at, updated_at). Indexes on `enabled` and `severity`. Existing events and anomalies tables untouched.
+- **Rule Repository** (`src/infrastructure/db/rule-repository.ts`): CRUD operations — `insertRule`, `findAllRules`, `findEnabledRules`, `findRuleById`, `updateRule`, `patchRule`, `deleteRule`. Follows existing repository patterns.
+- **Zod Validation** (`src/application/rule-schema.ts`): `thresholdConditionSchema` validates type="threshold", metric="count", operators (> >= < <= == !=), finite value, optional event_type/source filters. `createRuleSchema`, `updateRuleSchema`, `patchRuleSchema` for CRUD endpoints. Severity enum: critical | warning | info.
+- **CRUD Use Cases** (`src/application/rule-crud.ts`): Thin application-layer functions delegating to repository. `createRule`, `listRules`, `getRule`, `updateRuleFull`, `patchRulePartial`, `removeRule`.
+- **Threshold Evaluator** (`src/application/threshold-evaluator.ts`): `ThresholdEvaluator` class with per-rule sliding windows (sorted timestamp arrays, pruned from front) and per-rule cooldown maps. Injectable `nowFn` for deterministic testing. For each event: filter match → window add → prune → count → operator compare → cooldown check → emit anomaly.
+- **CRUD Routes** (`src/interfaces/http/rule-routes.ts`): POST (201), GET list, GET by ID, PUT, PATCH, DELETE (204). UUID validation on route params. Zod validation on bodies. 404 on not found. Plugin depends on `['db']`.
+- **Worker Integration** (`src/worker.ts`): Removed `InMemoryRuleRepository` and `EventWindow`. Loads enabled rules from Postgres via `findEnabledRules()`. Creates `ThresholdEvaluator`. Passes both to `startConsumer()`. Added `CREATE TABLE IF NOT EXISTS rules` + indexes.
+- **Stream Consumer** (`src/infrastructure/worker/stream-consumer.ts`): `ConsumerDeps` now holds `ThresholdEvaluator` + `RuleRow[]` instead of `Rule[]` + `EventWindow`. `startConsumer()` signature updated. `processEntry()` order changed to: insert → evaluate → persist anomaly → XACK. XACK moved to end of pipeline. Rule evaluation errors caught independently — do not prevent XACK.
+- **Unit Tests**: `tests/application/rule-crud.test.ts` (11 tests) — CRUD use cases with mocked repository. `tests/application/threshold-evaluator.test.ts` (23 tests) — filter matching, window behavior, all 6 operators, cooldown enforcement, multiple rules, edge cases.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Separate ThresholdEvaluator vs adapting Rule interface** | DB-backed rules are data-driven (JSON condition), fundamentally different from the existing `Rule` interface which requires an `evaluate()` method. A new evaluator avoids coupling the two paradigms. Existing rules remain untouched. |
+| **Per-rule sliding window as `number[]`** | Timestamps stored as epoch ms in sorted arrays. Pruning scans from the front (O(k) where k = expired entries), bounded by window_seconds. Simple, testable, no external dependency. |
+| **Per-rule cooldown map** | `Map<rule_id, lastTriggerMs>` prevents rapid-fire anomaly generation. Checked after threshold comparison. Cooldown of 0 means no suppression. |
+| **XACK after full pipeline** | Previous order was insert → XACK → evaluate. Now: insert → evaluate → anomaly persist → XACK. If anomaly persist fails mid-pipeline and worker crashes, the event is re-delivered and re-evaluated. Safer for reliability. |
+| **Injectable `nowFn` on evaluator** | Same pattern as timestamp-drift rule. Makes window expiry and cooldown logic fully deterministic in tests without mocking globals. |
+| **Severity enum: critical/warning/info** | Distinct from domain `Severity` (low/medium/high/critical). The rules table uses its own severity values as specified by the case study. Anomalies table stores severity as varchar(20) so either set works. |
+| **Zod at route layer** | Validation happens before the use case layer. Invalid input never reaches the repository. Consistent with existing `eventSchema` pattern. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/infrastructure/db/schema.ts` | Modified (added rules table) |
+| `src/infrastructure/db/rule-repository.ts` | New |
+| `src/infrastructure/db/index.ts` | Modified (added rule exports) |
+| `src/application/rule-schema.ts` | New |
+| `src/application/rule-crud.ts` | New |
+| `src/application/threshold-evaluator.ts` | New |
+| `src/application/index.ts` | Modified (added rule/threshold exports) |
+| `src/interfaces/http/rule-routes.ts` | New |
+| `src/interfaces/http/index.ts` | Modified (added ruleRoutes export) |
+| `src/infrastructure/index.ts` | Modified (added rule repo exports) |
+| `src/index.ts` | Modified (registered ruleRoutes) |
+| `src/worker.ts` | Modified (DB-backed rules, ThresholdEvaluator, rules CREATE TABLE) |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (ThresholdEvaluator, XACK order) |
+| `tests/application/rule-crud.test.ts` | New |
+| `tests/application/threshold-evaluator.test.ts` | New |
+| `vitest.config.ts` | Modified (added coverage paths) |
+
+### Not Modified
+- `src/domain/rules/*` (types.ts, rate-spike.ts, invalid-payload.ts, timestamp-drift.ts)
+- `src/application/rule-engine.ts` (EventWindow, evaluateEvent)
+- `src/infrastructure/rules/in-memory-rule-repo.ts` (kept for existing tests)
+- `tests/rules/*` (all existing tests untouched)
+- events table, anomalies table, existing indexes
+- Ingestion API routes, query API routes
+
+### Validation Method
+```bash
+# Rebuild containers
+docker compose up -d --build
+
+# Run all tests (existing + new)
+docker exec eventpulse-app npm test
+
+# Coverage (should maintain >80%)
+docker exec eventpulse-app npm run test:coverage
+
+# Create a rule
+curl -s -X POST http://localhost:3000/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "High error rate",
+    "severity": "critical",
+    "window_seconds": 60,
+    "cooldown_seconds": 300,
+    "condition": {
+      "type": "threshold",
+      "metric": "count",
+      "filters": { "event_type": "error", "source": "payment_service" },
+      "operator": ">",
+      "value": 5
+    }
+  }' | jq .
+# Expected: 201 with rule row including generated rule_id
+
+# List rules
+curl -s http://localhost:3000/api/v1/rules | jq .
+
+# Get single rule
+curl -s http://localhost:3000/api/v1/rules/<rule_id> | jq .
+
+# Update rule (PUT)
+curl -s -X PUT http://localhost:3000/api/v1/rules/<rule_id> \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Updated rule",
+    "enabled": true,
+    "severity": "warning",
+    "window_seconds": 120,
+    "cooldown_seconds": 60,
+    "condition": {
+      "type": "threshold",
+      "metric": "count",
+      "filters": { "event_type": "error" },
+      "operator": ">=",
+      "value": 3
+    }
+  }' | jq .
+
+# Partial update (PATCH)
+curl -s -X PATCH http://localhost:3000/api/v1/rules/<rule_id> \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": false}' | jq .
+
+# Delete rule
+curl -s -X DELETE http://localhost:3000/api/v1/rules/<rule_id>
+# Expected: 204 No Content
+
+# Trigger threshold rule (restart worker to pick up new rules)
+# 1. Create a rule with low threshold
+curl -s -X POST http://localhost:3000/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Error burst",
+    "severity": "critical",
+    "window_seconds": 60,
+    "cooldown_seconds": 0,
+    "condition": {
+      "type": "threshold",
+      "metric": "count",
+      "filters": { "event_type": "error" },
+      "operator": ">",
+      "value": 3
+    }
+  }' | jq .
+
+# 2. Restart worker to load the new rule
+docker restart eventpulse-worker
+
+# 3. Send 4+ matching events
+for i in $(seq 1 5); do
+  curl -s -X POST http://localhost:3000/api/v1/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_type\":\"error\",\"source\":\"payment_service\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"code\":500}}"
+  sleep 0.5
+done
+
+# 4. Check anomalies
+sleep 3
+curl -s http://localhost:3000/api/v1/anomalies | jq .
+# Expected: anomaly with the rule's rule_id should appear
+
+# Verify rules table in Postgres
+docker exec eventpulse-db psql -U eventpulse -c "SELECT rule_id, name, enabled, severity FROM rules;"
+docker exec eventpulse-db psql -U eventpulse -c "\di"  # Should show idx_rules_enabled, idx_rules_severity
+```

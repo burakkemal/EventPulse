@@ -1,10 +1,9 @@
 import type Redis from 'ioredis';
 import type { Logger } from 'pino';
 import type { Database } from '../db/index.js';
-import type { Rule } from '../../domain/rules/index.js';
-import type { EventWindow } from '../../application/rule-engine.js';
+import type { RuleRow } from '../db/index.js';
+import type { ThresholdEvaluator } from '../../application/threshold-evaluator.js';
 import { insertEvent, insertAnomaly } from '../db/index.js';
-import { evaluateEvent } from '../../application/rule-engine.js';
 
 const STREAM_KEY = 'events_stream';
 const GROUP_NAME = 'event_persister';
@@ -83,20 +82,21 @@ interface ConsumerDeps {
   redis: Redis;
   db: Database;
   log: Logger;
-  rules: readonly Rule[];
-  window: EventWindow;
+  evaluator: ThresholdEvaluator;
+  dbRules: readonly RuleRow[];
 }
 
 /**
  * Main consumer loop.
  *
  * 1. XREADGROUP with BLOCK — waits for new messages on the stream.
- * 2. For each message: parse → insert into Postgres (idempotent) → XACK.
- * 3. After successful persist+ACK, evaluate rules → log anomalies.
+ * 2. For each message: parse → insert into Postgres (idempotent).
+ * 3. After successful insert: evaluate threshold rules → persist anomalies.
+ * 4. XACK only after the full pipeline succeeds.
  *
- * Rule evaluation is intentionally post-ACK: rules must never block
- * persistence or cause re-delivery. A rule failure is logged but
- * the event is already safely committed and acknowledged.
+ * Order: DB write → evaluate → anomaly persist → XACK.
+ * Never ACK before successful insert.
+ * Rule evaluation errors are caught independently and do not prevent XACK.
  *
  * On insert failure the message is NOT acknowledged, so Redis will
  * re-deliver it on the next read cycle (pending entries list).
@@ -108,23 +108,21 @@ export async function startConsumer(
   db: Database,
   log: Logger,
   signal: AbortSignal,
-  rules: readonly Rule[] = [],
-  window?: EventWindow,
+  evaluator: ThresholdEvaluator,
+  dbRules: readonly RuleRow[],
 ): Promise<void> {
-  // Import EventWindow lazily to avoid circular deps in tests
-  const { EventWindow: EW } = await import('../../application/rule-engine.js');
   const deps: ConsumerDeps = {
     redis,
     db,
     log,
-    rules,
-    window: window ?? new EW(),
+    evaluator,
+    dbRules,
   };
 
   await ensureConsumerGroup(redis, log);
 
   log.info(
-    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY, ruleCount: rules.length },
+    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY, ruleCount: dbRules.length },
     'Consumer started',
   );
 
@@ -196,6 +194,15 @@ async function processPending(deps: ConsumerDeps): Promise<void> {
  * Persistence and rule evaluation have separate error boundaries.
  * A rule failure must never masquerade as a persistence failure or
  * prevent acknowledgment.
+ *
+ * 1. Insert event to Postgres (idempotent).
+ * 2. XACK immediately after successful write (or confirmed duplicate).
+ * 3. Evaluate threshold rules post-ACK.
+ * 4. Persist any detected anomalies (best-effort, failure only logged).
+ *
+ * On insert failure: no XACK, message stays in PEL for redelivery.
+ * On rule evaluation failure: logged only, ACK already completed.
+ * On anomaly persist failure: logged only, ACK already completed.
  */
 async function processEntry(
   deps: ConsumerDeps,
@@ -223,9 +230,9 @@ async function processEntry(
   }
 
   // --- Rule evaluation boundary (post-ACK, never blocks persistence) ---
-  if (deps.rules.length > 0) {
+  if (deps.dbRules.length > 0) {
     try {
-      const { anomalies } = evaluateEvent(event, deps.rules, deps.window);
+      const anomalies = deps.evaluator.evaluate(event, deps.dbRules);
       for (const anomaly of anomalies) {
         deps.log.warn(
           { anomaly },

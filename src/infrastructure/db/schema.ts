@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, timestamp, jsonb, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, timestamp, jsonb, index, boolean, integer } from 'drizzle-orm/pg-core';
 
 /**
  * Drizzle schema for the `events` table.
@@ -42,4 +42,26 @@ export const anomalies = pgTable('anomalies', {
   index('idx_anomalies_severity').on(table.severity),
   index('idx_anomalies_detected_at').on(table.detected_at),
   index('idx_anomalies_event_id').on(table.event_id),
+]);
+
+/**
+ * Drizzle schema for the `rules` table.
+ *
+ * Stores user-defined threshold rules managed via the CRUD API.
+ * Rules are loaded by the worker on startup and evaluated in-memory.
+ * `condition` is a JSONB column containing a threshold condition object.
+ */
+export const rules = pgTable('rules', {
+  rule_id: uuid('rule_id').primaryKey(),
+  name: varchar('name', { length: 255 }).notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+  severity: varchar('severity', { length: 20 }).notNull(),
+  window_seconds: integer('window_seconds').notNull(),
+  cooldown_seconds: integer('cooldown_seconds').notNull().default(0),
+  condition: jsonb('condition').notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index('idx_rules_enabled').on(table.enabled),
+  index('idx_rules_severity').on(table.severity),
 ]);

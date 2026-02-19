@@ -1,9 +1,8 @@
 import Redis from 'ioredis';
 import pino from 'pino';
-import { createDbClient } from './infrastructure/db/index.js';
+import { createDbClient, findEnabledRules } from './infrastructure/db/index.js';
 import { startConsumer } from './infrastructure/worker/index.js';
-import { InMemoryRuleRepository } from './infrastructure/rules/index.js';
-import { EventWindow } from './application/rule-engine.js';
+import { ThresholdEvaluator } from './application/threshold-evaluator.js';
 
 /**
  * Standalone worker process that consumes events from Redis Streams
@@ -11,6 +10,9 @@ import { EventWindow } from './application/rule-engine.js';
  *
  * Runs independently of the Fastify HTTP server — can be scaled
  * horizontally by launching multiple instances with different WORKER_ID values.
+ *
+ * Rules are loaded exclusively from the Postgres `rules` table.
+ * No in-memory defaults or hardcoded rule fallbacks.
  */
 const log = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
@@ -58,6 +60,20 @@ async function main(): Promise<void> {
     )
   `);
 
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS rules (
+      rule_id          UUID PRIMARY KEY,
+      name             VARCHAR(255) NOT NULL,
+      enabled          BOOLEAN      NOT NULL DEFAULT true,
+      severity         VARCHAR(20)  NOT NULL,
+      window_seconds   INTEGER      NOT NULL,
+      cooldown_seconds INTEGER      NOT NULL DEFAULT 0,
+      condition        JSONB        NOT NULL,
+      created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    )
+  `);
+
   // Create indexes if they don't already exist
   await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_event_type ON events (event_type)`);
   await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_events_source ON events (source)`);
@@ -67,16 +83,21 @@ async function main(): Promise<void> {
   await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_severity ON anomalies (severity)`);
   await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_detected_at ON anomalies (detected_at)`);
   await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_anomalies_event_id ON anomalies (event_id)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_rules_enabled ON rules (enabled)`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_rules_severity ON rules (severity)`);
 
-  log.info('Database ready (events + anomalies tables)');
+  log.info('Database ready (events + anomalies + rules tables)');
 
-  // Initialize rule engine with default rules
-  const ruleRepo = new InMemoryRuleRepository();
-  const rules = ruleRepo.getAll();
-  const eventWindow = new EventWindow();
-  log.info({ ruleCount: rules.length, ruleIds: rules.map((r) => r.id) }, 'Rules loaded');
+  // Load enabled rules from Postgres — no in-memory defaults.
+  // Rules must be created via the CRUD API before the worker will evaluate them.
+  const dbRules = await findEnabledRules(db);
+  const evaluator = new ThresholdEvaluator();
+  log.info(
+    { ruleCount: dbRules.length, ruleIds: dbRules.map((r) => r.rule_id) },
+    'Rules loaded from database',
+  );
 
-  await startConsumer(redis, db, log, ac.signal, rules, eventWindow);
+  await startConsumer(redis, db, log, ac.signal, evaluator, dbRules);
 }
 
 // Graceful shutdown on SIGINT / SIGTERM
