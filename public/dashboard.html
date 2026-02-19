@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EventPulse — Anomaly Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }
+    h1 { font-size: 1.5rem; margin-bottom: 8px; }
+    #status { font-size: 0.85rem; margin-bottom: 16px; color: #94a3b8; }
+    #status .connected { color: #4ade80; }
+    #status .disconnected { color: #f87171; }
+    #alerts { display: flex; flex-direction: column; gap: 8px; }
+    .alert {
+      padding: 12px 16px; border-radius: 8px; border-left: 4px solid;
+      background: #1e293b; animation: fadeIn 0.3s ease;
+    }
+    .alert.critical { border-color: #ef4444; }
+    .alert.warning { border-color: #f59e0b; }
+    .alert.info { border-color: #3b82f6; }
+    .alert .severity { font-weight: 600; text-transform: uppercase; font-size: 0.75rem; }
+    .alert .message { margin-top: 4px; }
+    .alert .meta { font-size: 0.75rem; color: #94a3b8; margin-top: 4px; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+  <h1>EventPulse Anomaly Dashboard</h1>
+  <div id="status">Status: <span id="conn" class="disconnected">Disconnected</span></div>
+  <div id="alerts"></div>
+
+  <script>
+    const connEl = document.getElementById('conn');
+    const alertsEl = document.getElementById('alerts');
+
+    /** @type {WebSocket|null} */
+    let ws = null;
+    /** @type {number|null} */
+    let reconnectTimer = null;
+
+    function connect() {
+      // Guard: do not open a second socket if one is already active
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(protocol + '//' + location.host + '/ws');
+
+      ws.onopen = function () {
+        connEl.textContent = 'Connected';
+        connEl.className = 'connected';
+        // Clear any pending reconnect
+        if (reconnectTimer !== null) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+      };
+
+      ws.onclose = function () {
+        connEl.textContent = 'Disconnected — reconnecting\u2026';
+        connEl.className = 'disconnected';
+        ws = null;
+        scheduleReconnect();
+      };
+
+      ws.onerror = function () {
+        // onclose will fire after onerror, so cleanup happens there
+      };
+
+      ws.onmessage = function (event) {
+        try {
+          var data = JSON.parse(event.data);
+          if (data.type === 'anomaly') {
+            var el = document.createElement('div');
+            el.className = 'alert ' + (data.severity || 'info');
+            el.innerHTML =
+              '<div class="severity">' + escapeHtml(data.severity || 'unknown') + '</div>' +
+              '<div class="message">' + escapeHtml(data.message || 'No message') + '</div>' +
+              '<div class="meta">Rule: ' + escapeHtml(data.rule_id || '?') + ' | ' + escapeHtml(data.detected_at || '') + '</div>';
+            alertsEl.prepend(el);
+          }
+        } catch (e) { /* ignore non-JSON */ }
+      };
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer !== null) return; // already scheduled
+      reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        connect();
+      }, 3000);
+    }
+
+    function escapeHtml(s) {
+      var d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    connect();
+  </script>
+</body>
+</html>

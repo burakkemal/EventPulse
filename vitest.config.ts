@@ -17,6 +17,10 @@ export default defineConfig({
         'src/application/rule-store.ts',
         'src/application/metrics.ts',
         'src/infrastructure/rules/**',
+        'src/infrastructure/notifications/config.ts',
+        'src/infrastructure/notifications/slack.ts',
+        'src/infrastructure/notifications/email.ts',
+        'src/infrastructure/notifications/dispatcher.ts',
       ],
       thresholds: {
         lines: 80,

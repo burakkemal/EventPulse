@@ -1,1 +1,1 @@
-﻿{"event_type":"page_view","source":"web","timestamp":"2026-02-19T10:01:32Z","payload":{"i":20}}
+﻿{"event_type":"error","source":"payment_service","timestamp":"2026-02-19T13:34:19Z","payload":{"code":500,"i":4}}

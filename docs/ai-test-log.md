@@ -62,6 +62,9 @@ All test and validation artifacts created/updated with AI assistance across Sess
 | `tests/application/rule-store.test.ts` | 8 | Unit tests for RuleStore atomic swap (6 tests) |
 | `tests/application/rule-subscriber.test.ts` | 8 | Unit tests for rule reload logic (7 tests) |
 | `tests/application/metrics.test.ts` | 9 | Unit tests for metrics use case + validation (18 tests) |
+| `tests/infrastructure/notification-config.test.ts` | 10 | Unit tests for YAML config loader (8 tests) |
+| `tests/infrastructure/notification-channels.test.ts` | 10 | Unit tests for Slack + Email channels (6 tests) |
+| `tests/infrastructure/notification-dispatcher.test.ts` | 10 | Unit tests for notification dispatcher (5 tests) |
 
 **Runbook corrections applied:** consumer group pre-step (1a), constants table with source references, PowerShell ingestion loop, jq-free alternatives, updated pass/fail criteria.
 

@@ -1,0 +1,11 @@
+websocket:
+  enabled: true
+
+slack:
+  enabled: false
+  webhook_url: ""
+
+email:
+  enabled: false
+  smtp_host: ""
+  recipients: []

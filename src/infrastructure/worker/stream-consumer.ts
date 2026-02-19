@@ -4,6 +4,7 @@ import type { Database } from '../db/index.js';
 import type { ThresholdEvaluator } from '../../application/threshold-evaluator.js';
 import type { RuleStore } from '../../application/rule-store.js';
 import { insertEvent, insertAnomaly } from '../db/index.js';
+import { publishAnomalyNotification } from '../redis/anomaly-notifier.js';
 
 const STREAM_KEY = 'events_stream';
 const GROUP_NAME = 'event_persister';
@@ -240,8 +241,9 @@ async function processEntry(
         );
 
         // Persist anomaly to Postgres (best-effort, failure only logged)
+        let anomalyId: string | undefined;
         try {
-          await insertAnomaly(deps.db, {
+          anomalyId = await insertAnomaly(deps.db, {
             event_id: anomaly.event_id,
             rule_id: anomaly.rule_id,
             severity: anomaly.severity,
@@ -253,6 +255,17 @@ async function processEntry(
             { err: persistErr, anomaly_rule_id: anomaly.rule_id, event_id: event.event_id },
             'Failed to persist anomaly',
           );
+        }
+
+        // Publish anomaly notification via Redis Pub/Sub (best-effort)
+        if (anomalyId) {
+          await publishAnomalyNotification(deps.redis, deps.log, {
+            anomaly_id: anomalyId,
+            rule_id: anomaly.rule_id,
+            severity: anomaly.severity,
+            message: anomaly.message,
+            detected_at: anomaly.detected_at,
+          });
         }
       }
     } catch (err: unknown) {

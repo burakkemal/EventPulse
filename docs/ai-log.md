@@ -906,3 +906,219 @@ curl -s 'http://localhost:3000/api/v1/metrics?group_by=invalid' | jq .
 curl -s 'http://localhost:3000/api/v1/metrics?window_seconds=5' | jq .
 # Expected: { "error": "window_seconds must be between 10 and 3600" }
 ```
+
+---
+
+## Session 10 — Notification Channels Infrastructure
+
+**Date:** 2026-02-19
+
+### Interaction Context (Provided to AI)
+
+- Notification channels infrastructure (P0 WebSocket, P1 Slack + Email stubs).
+- When an anomaly is persisted by the worker, publish a Redis Pub/Sub notification.
+- App subscribes and dispatches to configured channels: WebSocket broadcast, Slack webhook, Email stub.
+- YAML configuration file for channel settings (not stored in rules table).
+- No changes to ingestion, worker persistence semantics, or existing schemas.
+
+### Interaction Summary
+
+Built the notification pipeline from worker anomaly persistence through to real-time WebSocket push:
+
+- **Anomaly Notifier** (`src/infrastructure/redis/anomaly-notifier.ts`): `publishAnomalyNotification()` — publishes `{ anomaly_id, rule_id, severity, message, detected_at }` to `anomaly_notifications` Pub/Sub channel. Best-effort: failures logged as warnings, never block persistence.
+- **Anomaly Subscriber** (`src/infrastructure/redis/anomaly-subscriber.ts`): `startAnomalySubscriber()` — dedicated ioredis connection in subscriber mode (required by protocol). Parses payloads safely, validates required fields, dispatches to handler. Returns cleanup function.
+- **WebSocket Server** (`src/interfaces/ws/websocket-server.ts`): `WebSocketServer` class using raw Node.js HTTP upgrade (no external `ws` dependency). Implements RFC 6455 handshake, text frame encoding, ping/pong heartbeat. Attaches to Fastify's HTTP server on `/ws` path. Tracks clients, broadcasts anomaly JSON to all connected.
+- **Notification Config** (`config/notifications.yaml` + `src/infrastructure/notifications/config.ts`): YAML config loaded at app startup via `loadNotificationConfig()`. Minimal YAML parser for the flat config structure. WebSocket enabled by default; Slack/Email disabled. Falls back to defaults on missing/unparseable file.
+- **Slack Channel** (`src/infrastructure/notifications/slack.ts`): `sendSlackNotification()` — if enabled, POSTs formatted JSON to webhook URL via `fetch()`. If disabled, logs skip. Failures never crash pipeline.
+- **Email Channel** (`src/infrastructure/notifications/email.ts`): `sendEmailNotification()` — stub only. If enabled, logs structured message with recipients and anomaly summary. No SMTP integration.
+- **Notification Dispatcher** (`src/infrastructure/notifications/dispatcher.ts`): `createNotificationDispatcher()` — returns a handler that dispatches to all channels independently. WebSocket is synchronous, Slack/Email are fire-and-forget. Errors in one channel don't affect others.
+- **Worker Integration** (`src/infrastructure/worker/stream-consumer.ts`): After successful `insertAnomaly()`, calls `publishAnomalyNotification()`. Publishing is best-effort and never blocks persistence or XACK.
+- **App Wiring** (`src/index.ts`): After `fastify.listen()`, loads notification config, creates WebSocket server (attached to Fastify HTTP server), creates dispatcher, starts anomaly subscriber. Cleanup on shutdown.
+- **Demo Dashboard** (`public/dashboard.html`): Minimal HTML page with native WebSocket. Connects to `ws://host/ws`, displays anomaly toasts as styled cards. Auto-reconnects on disconnect.
+- **Unit Tests**: Config loader (8 tests), Slack/Email channels (6 tests), Dispatcher (5 tests).
+
+### Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **YAML config (temporary)** | Chosen for simplicity and zero schema impact. A production-ready solution SHOULD introduce a dedicated `notification_configurations` table managed via API, supporting per-rule channel routing, recipient overrides, and runtime CRUD. YAML has tradeoffs: no runtime mutation, no per-rule granularity, requires file access. Acceptable for this phase as a stepping stone. |
+| **Redis Pub/Sub for anomaly notifications** | Reuses existing Redis infrastructure. Worker publishes, app subscribes — clean decoupling. No new services or infra. Same pattern proven by rule hot-reload (Session 8). |
+| **WebSocket in app layer (not worker)** | The app process owns the HTTP server and client connections. Worker is a headless consumer. Routing notifications through Redis Pub/Sub from worker → app keeps responsibilities clean. |
+| **Raw HTTP upgrade (no `ws` package)** | Avoids adding a new dependency. Node.js provides the HTTP upgrade event and crypto for the handshake. Our use case (broadcast text frames < 64KB) is simple enough for a minimal implementation. |
+| **Dedicated Redis connection for subscriber** | ioredis protocol requirement — a client in subscriber mode cannot issue regular commands. Same pattern as rule-subscriber (Session 8). |
+| **Best-effort notification publish** | Notification failures must never block anomaly persistence. The worker's priority is insert → XACK → evaluate. Notifications are a downstream concern. |
+| **Dispatcher pattern** | Each channel is invoked independently with its own error boundary. A Slack failure doesn't prevent WebSocket broadcast or email logging. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `config/notifications.yaml` | New |
+| `src/infrastructure/notifications/config.ts` | New |
+| `src/infrastructure/notifications/slack.ts` | New |
+| `src/infrastructure/notifications/email.ts` | New |
+| `src/infrastructure/notifications/dispatcher.ts` | New |
+| `src/infrastructure/notifications/index.ts` | New |
+| `src/infrastructure/redis/anomaly-notifier.ts` | New |
+| `src/infrastructure/redis/anomaly-subscriber.ts` | New |
+| `src/interfaces/ws/websocket-server.ts` | New |
+| `public/dashboard.html` | New |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (anomaly notification publish) |
+| `src/index.ts` | Modified (notification channels wiring) |
+| `src/infrastructure/redis/index.ts` | Modified (new exports) |
+| `src/infrastructure/index.ts` | Modified (new exports) |
+| `vitest.config.ts` | Modified (coverage paths) |
+| `tests/infrastructure/notification-config.test.ts` | New |
+| `tests/infrastructure/notification-channels.test.ts` | New |
+| `tests/infrastructure/notification-dispatcher.test.ts` | New |
+
+### Not Modified
+- Ingestion API routes, query API routes, metrics endpoint
+- Worker persistence semantics (insert → XACK → evaluate)
+- Rules schema, events schema, anomalies schema
+- Rule CRUD endpoints, threshold evaluator
+- Existing tests (all pass without changes)
+
+### Validation Method
+```bash
+# Rebuild containers
+docker compose up -d --build
+
+# Run all tests (existing + new)
+docker exec eventpulse-app npm test
+
+# Coverage (should maintain >80%)
+docker exec eventpulse-app npm run test:coverage
+
+# Manual notification test:
+
+# 1. Open dashboard in browser
+open http://localhost:3000/dashboard
+
+# 2. Create a rule with low threshold
+curl -s -X POST http://localhost:3000/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Notification test",
+    "severity": "critical",
+    "window_seconds": 60,
+    "cooldown_seconds": 0,
+    "condition": {
+      "type": "threshold",
+      "metric": "count",
+      "filters": { "event_type": "error" },
+      "operator": ">",
+      "value": 2
+    }
+  }' | jq .
+
+# 3. Wait for rule hot-reload (check worker logs)
+sleep 2
+docker logs eventpulse-worker --tail 5
+
+# 4. Send 3+ matching events to trigger anomaly
+for i in $(seq 1 4); do
+  curl -s -X POST http://localhost:3000/api/v1/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_type\":\"error\",\"source\":\"payment_service\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"code\":500}}"
+  sleep 0.5
+done
+
+# 5. Check worker logs for anomaly notification publish
+docker logs eventpulse-worker --tail 10
+# Expected: "Publishing anomaly notification"
+
+# 6. Check app logs for notification dispatch
+docker logs eventpulse-app --tail 10
+# Expected: "Anomaly notification received"
+# Expected: "Broadcasting anomaly to clients"
+
+# 7. Dashboard should show anomaly toast in browser
+```
+
+---
+
+## Session 10 Fix — WebSocket Stability (P0)
+
+**Date:** 2026-02-19
+
+### Problem
+
+Clients connected successfully but disconnected **immediately** — before any anomaly broadcast could reach them:
+
+```
+{"clientId":130,"clientCount":1,"msg":"WebSocket upgrade accepted"}
+{"clientId":130,"clientCount":0,"msg":"WebSocket client disconnected"}
+{"msg":"Anomaly notification received"}
+{"clientCount":0,"sent":0,"msg":"Broadcasting anomaly to clients"}
+```
+
+The full pipeline (worker → Redis Pub/Sub → app subscriber → dispatcher) was confirmed working. The issue was strictly WebSocket socket lifecycle on the server side.
+
+### Root Cause — Definitive (Iteration 3)
+
+Iteration 2 added `setTimeout(0)`, `setNoDelay(true)`, `resume()`, and reason-based disconnect logging. Logs after that deploy showed every single disconnect had `reason:"end"` — the `socket.on('end')` handler fired within **1 ms** of upgrade acceptance.
+
+The `end` event on a `net.Socket` means the readable side received EOF (`push(null)`). After an HTTP upgrade, the Node.js HTTP parser signals "request body complete" by pushing `null` into the socket's readable stream **before** handing it off via the `upgrade` event. This is correct for normal HTTP requests, but for upgrades it's a false EOF — the WebSocket protocol continues on the same TCP connection.
+
+With the default `allowHalfOpen = false`, Node.js automatically calls `socket.end()` when the readable side ends, which triggers `close`, which our handler treated as a real disconnection. The full kill chain:
+
+```
+HTTP parser push(null) → 'end' event → auto socket.end() → 'close' event
+→ gracefulClose() → socket.destroy() → client gone (1 ms after upgrade)
+```
+
+### Fixes Applied (Iteration 3)
+
+Two targeted changes, both in `src/interfaces/ws/websocket-server.ts`:
+
+| Fix | Detail |
+|-----|--------|
+| `sock.allowHalfOpen = true` | **Primary fix.** Prevents the HTTP parser's spurious readable EOF from cascading into `socket.end()` → `close`. The socket stays alive for bidirectional WebSocket traffic. |
+| `end` handler: log-only, no close | Changed from `gracefulClose(client, 'end')` to debug-level log only. The `end` event is always a false positive from the HTTP parser on upgraded sockets. Real disconnections are caught by: `close` event (actual TCP teardown), heartbeat timeout (30 s), WS close frame, or socket error. |
+
+Previous iteration 2 fixes are retained (they are still correct, just insufficient alone):
+
+| Retained Fix | Purpose |
+|-----|--------|
+| `sock.setTimeout(0)` | Clears inherited HTTP timeout |
+| `sock.setNoDelay(true)` | Disables Nagle for immediate frame delivery |
+| `sock.setKeepAlive(true, 30_000)` | TCP-level keep-alive |
+| `sock.resume()` | Exits paused mode after parser detaches |
+| `net.Socket` type | Access to `setTimeout`, `setNoDelay`, `setKeepAlive`, `allowHalfOpen` |
+| `reason` param on `gracefulClose()` | Diagnostic reason string on every disconnect |
+| `sock.on('timeout')` handler | Logs and closes on unexpected timeout events |
+
+### Files Modified
+
+| File | Action |
+|------|--------|
+| `src/interfaces/ws/websocket-server.ts` | Added `allowHalfOpen = true`, changed `end` handler to log-only |
+
+### Validation Commands
+
+```bash
+# 1. Health check
+curl -s http://localhost:3000/health | jq .
+
+# 2. Open dashboard in browser
+open http://localhost:3000/dashboard
+# Expected: "Connected" (green) — stays connected permanently
+
+# 3. Trigger anomaly event
+curl -s -X POST http://localhost:3000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_type":"cpu_spike","source":"prod-web-01","payload":{"cpu_percent":99}}'
+
+# 4. Check app logs
+docker logs eventpulse-app --tail 20
+# Expected: "WebSocket upgrade accepted" {clientId:1, clientCount:1}
+# Expected: "Socket end event (readable EOF — ignored)" (debug-level, harmless)
+# Expected: NO "WebSocket client disconnected" after upgrade
+# Expected: "Ping sent" / "Pong received" cycling every 30s
+# Expected: "Broadcasting anomaly to clients" {clientCount:1, sent:1}
+
+# 5. Confirm no churn over 2+ minutes
+docker logs eventpulse-app 2>&1 | grep "disconnected"
+# Expected: no output
+```
