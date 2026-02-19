@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { resolve, join, extname } from 'node:path';
 
 import {
   redisPlugin,
@@ -45,24 +45,58 @@ async function main(): Promise<void> {
   await fastify.register(dbPlugin);
 
   // --------------------------------------------------
-  // Demo Dashboard Route
+  // Dashboard — Serve React SPA static assets
   // --------------------------------------------------
 
+  const DIST_DIR = resolve(process.cwd(), 'public', 'dist');
+
+  const MIME: Record<string, string> = {
+    '.html': 'text/html',
+    '.js':   'application/javascript',
+    '.css':  'text/css',
+    '.json': 'application/json',
+    '.svg':  'image/svg+xml',
+    '.png':  'image/png',
+    '.ico':  'image/x-icon',
+    '.map':  'application/json',
+  };
+
+  /**
+   * Serve built frontend assets from public/dist/.
+   * GET /dashboard       → index.html (SPA entry)
+   * GET /dashboard/assets/* → JS/CSS bundles
+   */
   fastify.get('/dashboard', (_req, reply) => {
     try {
-      const html = readFileSync(
-        resolve(process.cwd(), 'public', 'dashboard.html'),
-        'utf-8',
-      );
-
-      return reply
-        .type('text/html')
-        .send(html);
-
+      const html = readFileSync(resolve(DIST_DIR, 'index.html'), 'utf-8');
+      return reply.type('text/html').send(html);
     } catch {
-      return reply
-        .status(404)
-        .send({ error: 'Dashboard not found' });
+      fastify.log.warn('Dashboard build not found at public/dist/index.html');
+      return reply.status(404).send({ error: 'Dashboard not found — run: npm run build:frontend' });
+    }
+  });
+
+  fastify.get('/dashboard/*', (req, reply) => {
+    const urlPath = (req.url.replace('/dashboard/', '') || '').split('?')[0] ?? '';
+    const filePath = join(DIST_DIR, urlPath);
+
+    // Security: reject path traversal
+    if (!filePath.startsWith(DIST_DIR)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    try {
+      if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+        // SPA fallback: serve index.html for non-file routes
+        const html = readFileSync(resolve(DIST_DIR, 'index.html'), 'utf-8');
+        return reply.type('text/html').send(html);
+      }
+      const ext = extname(filePath);
+      const mime = MIME[ext] ?? 'application/octet-stream';
+      const content = readFileSync(filePath);
+      return reply.type(mime).send(content);
+    } catch {
+      return reply.status(404).send({ error: 'Not found' });
     }
   });
 

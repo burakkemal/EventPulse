@@ -1122,3 +1122,156 @@ docker logs eventpulse-app --tail 20
 docker logs eventpulse-app 2>&1 | grep "disconnected"
 # Expected: no output
 ```
+
+---
+
+## Session 11 — Dashboard (FR-05)
+
+**Date:** 2026-02-19
+
+### Overview
+
+Implemented a React + TypeScript dashboard served as static assets from Fastify at `GET /dashboard`. Uses Vite for build, Recharts for charting. Consumes only existing REST endpoints — no new backend endpoints added.
+
+### Panels Implemented
+
+| # | Panel | Source API | Description |
+|---|-------|-----------|-------------|
+| 1 | Throughput Chart | `GET /api/v1/metrics` | Bar chart of events/sec per event_type within the selected time window |
+| 2 | Error Rate Gauge | `GET /api/v1/metrics` | Computed error_count/total ratio. Green <1%, Yellow <5%, Red ≥5% |
+| 3 | Top Events Table | `GET /api/v1/metrics` | Sortable table: event_type, count, rate_per_sec. Click column headers to sort |
+| 4 | Anomaly Timeline | `GET /api/v1/anomalies` + `GET /api/v1/events/:id` | Dot timeline by severity. Click dot → fetch event detail in side panel |
+| 5 | System Health | `GET /api/v1/events/health` | Status indicators: API (ok if health responds), Redis (from health.status), Database (ok if health responds), Worker (always "unknown") |
+| 6 | Live Event Feed | `GET /api/v1/events` | Scrollable feed, newest first. Expandable payload JSON per row |
+
+### APIs Used
+
+- `GET /api/v1/metrics?window_seconds=N&group_by=event_type&event_type=X&source=Y` — Panels 1, 2, 3
+- `GET /api/v1/events?limit=100&from=ISO&event_type=X&source=Y` — Panel 6
+- `GET /api/v1/events/:id` — Panel 4 (on click)
+- `GET /api/v1/anomalies?limit=100&severity=X` — Panel 4
+- `GET /api/v1/events/health` — Panel 5
+
+### WebSocket-Ready Architecture
+
+The dashboard is structured for real-time updates without requiring architectural changes when WebSocket is wired in:
+
+1. **Central state store** (`src/frontend/store/DashboardContext.tsx`) — React Context + useReducer holds all dashboard data. Components never call `fetch` directly.
+
+2. **WebSocket adapter stub** (`src/frontend/realtime/socket.ts`) — exposes `connect()`, `subscribe(handler)`, `disconnect()`. Currently a no-op. The store already subscribes to this adapter on mount and dispatches incoming anomalies via `PREPEND_ANOMALY` action. When WebSocket is implemented, only `socket.ts` changes — all consumers remain untouched.
+
+3. **Separated API layer** (`src/frontend/api/client.ts`) — all fetch calls in one module. Components consume the store, not the API directly.
+
+**To wire WebSocket later**: implement the actual `new WebSocket(...)` connection in `socket.ts` and call registered handlers on `ws.onmessage`. The store's subscription handler already dispatches the incoming data.
+
+### Interactivity
+
+- **Time range selector**: 15m / 1h / 6h / 24h buttons. 6h and 24h display a hint that metrics window is capped at 3600s (backend limit); the event feed uses the full range.
+- **Filters**: event_type, source (text input), severity (dropdown). Applied via "Apply" button or Enter key.
+- **Auto-refresh**: 30s polling interval via `setInterval` in the DashboardProvider.
+- **Responsive**: CSS Grid with tablet breakpoint at 1024px.
+
+### Architecture
+
+```
+src/frontend/
+├── api/
+│   ├── types.ts          # Response type definitions
+│   ├── client.ts         # Centralized fetch wrappers
+│   └── index.ts          # Barrel
+├── realtime/
+│   ├── socket.ts         # WebSocket adapter stub
+│   └── index.ts          # Barrel
+├── store/
+│   ├── DashboardContext.tsx  # Central state (Context + useReducer)
+│   └── index.ts             # Barrel
+├── dashboard/
+│   ├── charts/
+│   │   ├── ThroughputChart.tsx
+│   │   └── ErrorRateGauge.tsx
+│   ├── panels/
+│   │   ├── TopEventsTable.tsx
+│   │   ├── AnomalyTimeline.tsx
+│   │   ├── SystemHealth.tsx
+│   │   └── LiveEventFeed.tsx
+│   └── layout/
+│       ├── Toolbar.tsx
+│       └── DashboardLayout.tsx
+├── App.tsx
+├── main.tsx
+├── styles.css
+├── index.html
+└── tsconfig.json
+```
+
+### Build Pipeline
+
+- **Vite** (`vite.config.ts`) — root=`src/frontend`, base=`/dashboard/`, output=`public/dist/`
+- **`npm run build:frontend`** — runs `vite build`
+- **Dockerfile** — runs `npm run build:frontend` during image build
+- **Fastify** (`src/index.ts`) — serves `public/dist/` at `/dashboard` and `/dashboard/*` with SPA fallback
+- **Backend tsconfig** — excludes `src/frontend` so `tsc` doesn't try to compile JSX/DOM code
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `src/frontend/api/types.ts` | API response type definitions |
+| `src/frontend/api/client.ts` | Centralized fetch wrappers |
+| `src/frontend/api/index.ts` | Barrel export |
+| `src/frontend/realtime/socket.ts` | WebSocket adapter stub (no-op) |
+| `src/frontend/realtime/index.ts` | Barrel export |
+| `src/frontend/store/DashboardContext.tsx` | Central state store (Context + useReducer) |
+| `src/frontend/store/index.ts` | Barrel export |
+| `src/frontend/dashboard/charts/ThroughputChart.tsx` | Throughput bar chart (Recharts) |
+| `src/frontend/dashboard/charts/ErrorRateGauge.tsx` | Error rate circular gauge |
+| `src/frontend/dashboard/panels/TopEventsTable.tsx` | Sortable metrics table |
+| `src/frontend/dashboard/panels/AnomalyTimeline.tsx` | Timeline dots + event detail |
+| `src/frontend/dashboard/panels/SystemHealth.tsx` | Health status indicators |
+| `src/frontend/dashboard/panels/LiveEventFeed.tsx` | Scrollable event feed |
+| `src/frontend/dashboard/layout/Toolbar.tsx` | Time range + filters toolbar |
+| `src/frontend/dashboard/layout/DashboardLayout.tsx` | Responsive grid layout |
+| `src/frontend/App.tsx` | Root component |
+| `src/frontend/main.tsx` | Entry point |
+| `src/frontend/styles.css` | Global dark theme styles |
+| `src/frontend/index.html` | HTML shell |
+| `src/frontend/tsconfig.json` | Frontend-specific TS config |
+| `vite.config.ts` | Vite build configuration |
+| `tests/frontend/api-client.test.ts` | API client URL + error tests |
+| `tests/frontend/socket.test.ts` | WebSocket stub contract tests |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `package.json` | Added react, react-dom, recharts, @types/react, @types/react-dom, @vitejs/plugin-react, vite. Added `build:frontend` and `dev:frontend` scripts |
+| `tsconfig.json` | Excluded `src/frontend` from backend compilation |
+| `Dockerfile` | Added `RUN npm run build:frontend` step |
+| `src/index.ts` | Replaced old `/dashboard` route with SPA static serving from `public/dist/` |
+
+### Validation Commands
+
+```bash
+# 1. Rebuild everything (includes frontend build in Docker)
+docker compose up -d --build
+
+# 2. Verify health
+curl -s http://localhost:3000/api/v1/events/health | jq .
+
+# 3. Open dashboard
+open http://localhost:3000/dashboard
+# Expected: React dashboard with 6 panels, dark theme
+
+# 4. Ingest test events
+for i in $(seq 1 10); do
+  curl -s -X POST http://localhost:3000/api/v1/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_type\":\"cpu_spike\",\"source\":\"web-0${i}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"cpu_percent\":$((70+i))}}"
+done
+
+# 5. Refresh dashboard — should show events in feed and metrics in charts
+
+# 6. Test filters — type "cpu_spike" in event_type filter, click Apply
+
+# 7. Test time range — click 15m, 1h, 6h buttons
+```

@@ -50,11 +50,13 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    command : ["sh", "-c", "npm run build:frontend && npm run dev"]
     volumes:
       # Full repo mount — makes tests, configs, docs visible inside container
       - .:/app
       # Named volume masks host node_modules, preserves container's npm install
       - app_node_modules:/app/node_modules
+      - dashboard_dist:/app/public/dist   # 👈 build çıktısını korur
 
   worker:
     build:
