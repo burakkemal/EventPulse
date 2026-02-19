@@ -13,6 +13,7 @@ import {
   patchRulePartial,
   removeRule,
 } from '../../application/rule-crud.js';
+import { publishRuleChange } from '../../infrastructure/redis/rule-notifier.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -49,6 +50,7 @@ async function ruleRoutes(fastify: FastifyInstance): Promise<void> {
         condition: parsed.data.condition as Record<string, unknown>,
       });
 
+      await publishRuleChange(fastify.redis, fastify.log, 'create', row.rule_id);
       return reply.status(201).send(row);
     },
   );
@@ -113,6 +115,7 @@ async function ruleRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'Rule not found' });
       }
 
+      await publishRuleChange(fastify.redis, fastify.log, 'update', rule_id);
       return reply.status(200).send(row);
     },
   );
@@ -147,6 +150,7 @@ async function ruleRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'Rule not found' });
       }
 
+      await publishRuleChange(fastify.redis, fastify.log, 'patch', rule_id);
       return reply.status(200).send(row);
     },
   );
@@ -168,6 +172,7 @@ async function ruleRoutes(fastify: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'Rule not found' });
       }
 
+      await publishRuleChange(fastify.redis, fastify.log, 'delete', rule_id);
       return reply.status(204).send();
     },
   );
@@ -175,6 +180,6 @@ async function ruleRoutes(fastify: FastifyInstance): Promise<void> {
 
 export default fp(ruleRoutes, {
   name: 'rule-routes',
-  dependencies: ['db'],
+  dependencies: ['db', 'redis'],
   fastify: '5.x',
 });

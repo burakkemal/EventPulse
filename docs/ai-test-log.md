@@ -59,6 +59,8 @@ All test and validation artifacts created/updated with AI assistance across Sess
 | `tests/application/query-anomalies.test.ts` | 6 | Unit tests for listAnomalies use case (12 tests) |
 | `tests/application/rule-crud.test.ts` | 7 | Unit tests for rule CRUD use cases (11 tests) |
 | `tests/application/threshold-evaluator.test.ts` | 7 | Unit tests for ThresholdEvaluator (23 tests) |
+| `tests/application/rule-store.test.ts` | 8 | Unit tests for RuleStore atomic swap (6 tests) |
+| `tests/application/rule-subscriber.test.ts` | 8 | Unit tests for rule reload logic (7 tests) |
 
 **Runbook corrections applied:** consumer group pre-step (1a), constants table with source references, PowerShell ingestion loop, jq-free alternatives, updated pass/fail criteria.
 

@@ -14,6 +14,7 @@ export default defineConfig({
         'src/application/rule-crud.ts',
         'src/application/rule-schema.ts',
         'src/application/threshold-evaluator.ts',
+        'src/application/rule-store.ts',
         'src/infrastructure/rules/**',
       ],
       thresholds: {

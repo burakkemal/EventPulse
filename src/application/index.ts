@@ -10,3 +10,4 @@ export type { ThresholdCondition, RuleSeverity, CreateRuleInput, UpdateRuleInput
 export { createRule, listRules, getRule, updateRuleFull, patchRulePartial, removeRule } from './rule-crud.js';
 export { ThresholdEvaluator } from './threshold-evaluator.js';
 export type { ThresholdAnomaly, EvaluatableEvent } from './threshold-evaluator.js';
+export { RuleStore } from './rule-store.js';

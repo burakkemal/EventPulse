@@ -708,3 +708,113 @@ docker exec eventpulse-db psql -U eventpulse -c "\di"  # Should show idx_rules_e
 - **What was changed:** Restored the original ordering: insert → XACK → evaluate → anomaly persist. XACK was moved back inside the persistence `try/catch` block, immediately after `insertEvent()`. The standalone XACK `try/catch` at the end of `processEntry()` was removed. Both the `startConsumer` and `processEntry` docblocks were updated to reflect the correct order.
 - **Files changed:** `src/infrastructure/worker/stream-consumer.ts` (only file modified).
 - **How validated:** Run unit tests (`npm test`) and coverage (`npm run test:coverage`). No test changes required — the fix is in infrastructure code covered by integration testing.
+
+---
+
+## Session 8 — Rule Hot Reload (Redis Pub/Sub)
+
+**Date:** 2026-02-19
+
+### Interaction Context (Provided to AI)
+
+- Phase 8 of the EventPulse senior backend case study.
+- Scope: Redis Pub/Sub-based hot reload for DB-backed rules. No worker restart needed.
+- No polling, no new infra, no auth/UI changes.
+- Persistence semantics unchanged: insert → XACK → evaluate → anomaly persist.
+- ioredis requires a dedicated connection for Pub/Sub subscriber mode.
+
+### Interaction Summary
+
+Added live rule reload so the worker picks up CRUD changes without restart:
+
+- **RuleStore** (`src/application/rule-store.ts`): Atomic swap wrapper holding a `readonly RuleRow[]` snapshot. `get()` returns the current snapshot (O(1), no copy). `set()` replaces it atomically. Thread-safe by virtue of Node.js single-threaded execution — no torn reads.
+- **Rule Notifier** (`src/infrastructure/redis/rule-notifier.ts`): `publishRuleChange()` — publishes a lightweight JSON payload (`{ ts, reason, rule_id }`) to the `rules_changed` Pub/Sub channel. Best-effort: publish failures are logged but never propagated to the HTTP response.
+- **Rule Subscriber** (`src/infrastructure/worker/rule-subscriber.ts`): `startRuleSubscriber()` — creates a dedicated ioredis client in subscriber mode, subscribes to `rules_changed`. On message: reloads enabled rules from Postgres via `findEnabledRules()` and swaps the store snapshot. Includes a concurrent-reload guard. `reloadRules()` exported separately for unit testing.
+- **Rule Routes** (`src/interfaces/http/rule-routes.ts`): After successful POST/PUT/PATCH/DELETE, calls `publishRuleChange()` with the appropriate reason and rule_id. Plugin dependencies updated from `['db']` to `['db', 'redis']`.
+- **Worker Bootstrap** (`src/worker.ts`): Creates `RuleStore` with initial rules. Starts rule subscriber before consumer. Subscriber cleanup added to graceful shutdown path.
+- **Stream Consumer** (`src/infrastructure/worker/stream-consumer.ts`): `ConsumerDeps.dbRules` replaced with `ConsumerDeps.ruleStore`. `startConsumer()` now accepts `RuleStore` instead of `readonly RuleRow[]`. `processEntry()` reads `deps.ruleStore.get()` on each event evaluation — always the latest snapshot.
+- **Unit Tests**: `tests/application/rule-store.test.ts` (6 tests) — init, set/get, empty, consecutive swaps. `tests/application/rule-subscriber.test.ts` (7 tests) — reload success, logging, concurrent guard, DB failure resilience, non-JSON message handling.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Dedicated Redis client for subscriber** | ioredis (and Redis protocol) requires a connection in subscriber mode to be exclusively used for subscriptions — it cannot issue regular commands. A second connection is the minimum viable approach. |
+| **RuleStore atomic swap** | Node.js is single-threaded, so `get()`/`set()` on a reference are inherently atomic. No locks or mutexes needed. The consumer always reads a complete snapshot — either old or new. |
+| **Best-effort publish** | Pub/Sub publish failure must never fail a CRUD HTTP request. The worker will still load rules at startup; Pub/Sub is an optimization, not a correctness requirement. |
+| **Concurrent reload guard** | Rapid CRUD bursts (e.g., bulk import) could trigger many reloads simultaneously. A simple boolean flag skips overlapping reloads — the last one wins since it reads the latest DB state. |
+| **`reloadRules()` exported for testing** | Separates the reload logic from the ioredis subscription wiring. Unit tests exercise reload behavior without requiring a real Redis connection. |
+| **No polling** | Pub/Sub is event-driven — zero CPU cost when idle. No timer, no interval, no wasted queries. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/application/rule-store.ts` | New |
+| `src/infrastructure/redis/rule-notifier.ts` | New |
+| `src/infrastructure/worker/rule-subscriber.ts` | New |
+| `src/interfaces/http/rule-routes.ts` | Modified (publish after mutations, added `redis` dependency) |
+| `src/worker.ts` | Modified (RuleStore, subscriber startup + shutdown) |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (RuleStore replaces `readonly RuleRow[]`) |
+| `src/application/index.ts` | Modified (added RuleStore export) |
+| `src/infrastructure/redis/index.ts` | Modified (added notifier exports) |
+| `src/infrastructure/worker/index.ts` | Modified (added subscriber exports) |
+| `src/infrastructure/index.ts` | Modified (added notifier + subscriber re-exports) |
+| `vitest.config.ts` | Modified (added rule-store.ts to coverage) |
+| `tests/application/rule-store.test.ts` | New |
+| `tests/application/rule-subscriber.test.ts` | New |
+
+### Not Modified
+- Ingestion API routes, query API routes
+- `insertEvent → XACK → evaluate → anomaly persist` order (unchanged)
+- Existing rule evaluation logic (ThresholdEvaluator)
+- Existing tests (all pass without changes)
+- DB schema (no new tables or columns)
+
+### Validation Method
+```bash
+# Rebuild containers
+docker compose up -d --build
+
+# Run all tests (existing + new)
+docker exec eventpulse-app npm test
+
+# Coverage (should maintain >80%)
+docker exec eventpulse-app npm run test:coverage
+
+# Manual hot-reload validation:
+# 1. Create a rule with low threshold
+curl -s -X POST http://localhost:3000/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Hot reload test",
+    "severity": "critical",
+    "window_seconds": 60,
+    "cooldown_seconds": 0,
+    "condition": {
+      "type": "threshold",
+      "metric": "count",
+      "filters": { "event_type": "error" },
+      "operator": ">",
+      "value": 2
+    }
+  }' | jq .
+
+# 2. Check worker logs — should show "Rules reloaded successfully" with ruleCount
+docker logs eventpulse-worker --tail 10
+# Expected: "Rule change detected, reloading rules from database…"
+# Expected: "Rules reloaded successfully" { ruleCount: 1, ruleIds: [...] }
+
+# 3. NO worker restart needed — send 3+ matching events
+for i in $(seq 1 4); do
+  curl -s -X POST http://localhost:3000/api/v1/events \
+    -H 'Content-Type: application/json' \
+    -d "{\"event_type\":\"error\",\"source\":\"payment_service\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"code\":500}}"
+  sleep 0.5
+done
+
+# 4. Check anomalies — should see anomaly from the hot-reloaded rule
+sleep 3
+curl -s http://localhost:3000/api/v1/anomalies | jq .
+# Expected: anomaly with the new rule's rule_id
+```

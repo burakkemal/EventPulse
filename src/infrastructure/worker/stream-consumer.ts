@@ -1,8 +1,8 @@
 import type Redis from 'ioredis';
 import type { Logger } from 'pino';
 import type { Database } from '../db/index.js';
-import type { RuleRow } from '../db/index.js';
 import type { ThresholdEvaluator } from '../../application/threshold-evaluator.js';
+import type { RuleStore } from '../../application/rule-store.js';
 import { insertEvent, insertAnomaly } from '../db/index.js';
 
 const STREAM_KEY = 'events_stream';
@@ -83,7 +83,7 @@ interface ConsumerDeps {
   db: Database;
   log: Logger;
   evaluator: ThresholdEvaluator;
-  dbRules: readonly RuleRow[];
+  ruleStore: RuleStore;
 }
 
 /**
@@ -108,20 +108,20 @@ export async function startConsumer(
   log: Logger,
   signal: AbortSignal,
   evaluator: ThresholdEvaluator,
-  dbRules: readonly RuleRow[],
+  ruleStore: RuleStore,
 ): Promise<void> {
   const deps: ConsumerDeps = {
     redis,
     db,
     log,
     evaluator,
-    dbRules,
+    ruleStore,
   };
 
   await ensureConsumerGroup(redis, log);
 
   log.info(
-    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY, ruleCount: dbRules.length },
+    { consumer: CONSUMER_NAME, group: GROUP_NAME, stream: STREAM_KEY, ruleCount: ruleStore.get().length },
     'Consumer started',
   );
 
@@ -229,9 +229,10 @@ async function processEntry(
   }
 
   // --- Rule evaluation boundary (post-ACK, never blocks persistence) ---
-  if (deps.dbRules.length > 0) {
+  const currentRules = deps.ruleStore.get();
+  if (currentRules.length > 0) {
     try {
-      const anomalies = deps.evaluator.evaluate(event, deps.dbRules);
+      const anomalies = deps.evaluator.evaluate(event, currentRules);
       for (const anomaly of anomalies) {
         deps.log.warn(
           { anomaly },

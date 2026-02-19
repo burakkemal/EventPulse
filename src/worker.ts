@@ -2,7 +2,9 @@ import Redis from 'ioredis';
 import pino from 'pino';
 import { createDbClient, findEnabledRules } from './infrastructure/db/index.js';
 import { startConsumer } from './infrastructure/worker/index.js';
+import { startRuleSubscriber } from './infrastructure/worker/rule-subscriber.js';
 import { ThresholdEvaluator } from './application/threshold-evaluator.js';
+import { RuleStore } from './application/rule-store.js';
 
 /**
  * Standalone worker process that consumes events from Redis Streams
@@ -29,6 +31,9 @@ const { sql, db } = createDbClient(databaseUrl);
 
 // Abort controller for graceful shutdown
 const ac = new AbortController();
+
+// Subscriber cleanup function — assigned during main()
+let cleanupSubscriber: (() => Promise<void>) | null = null;
 
 async function main(): Promise<void> {
   await redis.connect();
@@ -91,13 +96,18 @@ async function main(): Promise<void> {
   // Load enabled rules from Postgres — no in-memory defaults.
   // Rules must be created via the CRUD API before the worker will evaluate them.
   const dbRules = await findEnabledRules(db);
+  const ruleStore = new RuleStore(dbRules);
   const evaluator = new ThresholdEvaluator();
   log.info(
     { ruleCount: dbRules.length, ruleIds: dbRules.map((r) => r.rule_id) },
     'Rules loaded from database',
   );
 
-  await startConsumer(redis, db, log, ac.signal, evaluator, dbRules);
+  // Subscribe to rule change notifications for hot reload.
+  // Uses a dedicated Redis connection (ioredis subscribe requirement).
+  cleanupSubscriber = await startRuleSubscriber(redisUrl, db, log, ruleStore, ac.signal);
+
+  await startConsumer(redis, db, log, ac.signal, evaluator, ruleStore);
 }
 
 // Graceful shutdown on SIGINT / SIGTERM
@@ -107,6 +117,7 @@ function shutdown(): void {
 
   // Give in-flight operations a moment, then force exit
   setTimeout(async () => {
+    if (cleanupSubscriber) await cleanupSubscriber().catch(() => {});
     await redis.quit().catch(() => {});
     await sql.end().catch(() => {});
     process.exit(0);
