@@ -93,6 +93,41 @@ async function main(): Promise<void> {
 
   log.info('Database ready (events + anomalies + rules tables)');
 
+  // ── Best-effort retention cleanup (local dev only) ──────────────
+  // Runs once at startup. Deletes rows older than the configured
+  // retention window. Value 0 disables cleanup for that table.
+  // Failures are logged at warn level and never block startup.
+  const eventRetentionDays = parseInt(process.env['EVENT_RETENTION_DAYS'] ?? '30', 10);
+  const anomalyRetentionDays = parseInt(process.env['ANOMALY_RETENTION_DAYS'] ?? '90', 10);
+
+  if (eventRetentionDays > 0) {
+    try {
+      const result = await sql`
+          DELETE FROM events
+          WHERE timestamp < now() - (${eventRetentionDays} * interval '1 day')
+          `;
+      log.info({ table: 'events', deletedRows: result.count, retentionDays: eventRetentionDays }, 'Retention cleanup completed');
+    } catch (err: unknown) {
+      log.warn({ err, table: 'events' }, 'Retention cleanup failed — continuing startup');
+    }
+  } else {
+    log.info({ table: 'events' }, 'Retention cleanup disabled (EVENT_RETENTION_DAYS=0)');
+  }
+
+  if (anomalyRetentionDays > 0) {
+    try {
+      const result = await sql`
+          DELETE FROM anomalies
+          WHERE detected_at < now() - (${anomalyRetentionDays} * interval '1 day')
+          `;
+      log.info({ table: 'anomalies', deletedRows: result.count, retentionDays: anomalyRetentionDays }, 'Retention cleanup completed');
+    } catch (err: unknown) {
+      log.warn({ err, table: 'anomalies' }, 'Retention cleanup failed — continuing startup');
+    }
+  } else {
+    log.info({ table: 'anomalies' }, 'Retention cleanup disabled (ANOMALY_RETENTION_DAYS=0)');
+  }
+
   // Load enabled rules from Postgres — no in-memory defaults.
   // Rules must be created via the CRUD API before the worker will evaluate them.
   const dbRules = await findEnabledRules(db);

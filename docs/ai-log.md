@@ -1275,3 +1275,103 @@ done
 
 # 7. Test time range — click 15m, 1h, 6h buttons
 ```
+
+---
+
+## AI Corrections / Fixes — Retention Cleanup (Post-Session 11)
+
+**Date:** 2026-02-19
+**Classification:** Infrastructure safety correction
+
+### Reason for Change
+
+During FR-03 retention validation testing, the system was found to lack any mechanism for cleaning up old events or anomalies. Rows accumulate indefinitely, which is unsuitable even for local development environments. This corrective change introduces a minimal, best-effort retention cleanup executed once at worker startup.
+
+### Description
+
+A configurable retention cleanup runs at worker startup (after table creation, before rule loading):
+
+- **`EVENT_RETENTION_DAYS`** (default `30`): Deletes rows from `events` where `timestamp < now() - interval '<N> days'`.
+- **`ANOMALY_RETENTION_DAYS`** (default `90`): Deletes rows from `anomalies` where `detected_at < now() - interval '<N> days'`.
+- Setting either value to `0` disables cleanup for that table.
+- Each DELETE is wrapped in its own `try/catch`. Failures log at `warn` level and never block worker startup.
+- On success, an `info`-level log reports the table name, deleted row count, and retention window.
+
+### What Was NOT Changed
+
+- **Ingestion API behavior**: `POST /api/v1/events` and `POST /api/v1/events/batch` are completely untouched.
+- **Redis Stream semantics**: No changes to `XADD`, `XREADGROUP`, `XACK`, consumer group creation, or pending entry recovery.
+- **DB write + XACK ordering**: The `insertEvent → XACK → evaluate → anomaly persist` pipeline in `stream-consumer.ts` is untouched.
+- **Rule evaluation, hot reload, notifications**: No changes.
+- **No new dependencies, migrations, or infrastructure components.**
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/worker.ts` | Added retention cleanup block (two isolated DELETE queries with try/catch) |
+| `.env.example` | Added `EVENT_RETENTION_DAYS` and `ANOMALY_RETENTION_DAYS` with documentation |
+| `docs/ai-log.md` | This entry |
+
+### Validation (PowerShell-friendly)
+
+```powershell
+# 1. Insert a 90-day-old test event
+docker exec eventpulse-db psql -U eventpulse -c "INSERT INTO events (event_id, event_type, source, timestamp, payload, metadata) VALUES ('aaaaaaaa-0000-0000-0000-000000000001', 'retention_test', 'retention_test', now() - interval '90 days', '{}', '{}');"
+
+# 2. Confirm the row exists
+docker exec eventpulse-db psql -U eventpulse -c "SELECT COUNT(*) FROM events WHERE source='retention_test';"
+# Expected: 1
+
+# 3. Restart the worker (triggers retention cleanup on startup)
+docker restart eventpulse-worker
+
+# 4. Wait for worker startup
+Start-Sleep -Seconds 5
+
+# 5. Confirm the row was deleted
+docker exec eventpulse-db psql -U eventpulse -c "SELECT COUNT(*) FROM events WHERE source='retention_test';"
+# Expected: 0
+
+# 6. Verify worker logs show cleanup
+docker logs eventpulse-worker --tail 20 2>&1 | Select-String "Retention cleanup"
+# Expected: "Retention cleanup completed" with deletedRows >= 1
+```
+
+### AI Corrections / Fixes — Retention Policy (FR-03)
+
+**File:** `src/worker.ts`
+
+Retention validation testing identified that historical event data remained
+indefinitely in PostgreSQL, meaning the system lacked an explicit data
+retention policy despite FR-03 requiring retention controls for the
+time-series store.
+
+A minimal best-effort retention cleanup step was added to the worker
+startup sequence.
+
+Changes applied:
+
+- Added configurable retention cleanup executed once during worker startup.
+- Introduced environment variables:
+  - `EVENT_RETENTION_DAYS` (default: 30)
+  - `ANOMALY_RETENTION_DAYS` (default: 90)
+  - Value `0` disables cleanup.
+- Implemented parameterized SQL deletes using postgres.js template queries
+  (removed prior unsafe string interpolation approach).
+- Cleanup runs inside isolated try/catch blocks and logs warn-level errors
+  without blocking worker startup.
+- Persistence semantics remain unchanged:
+  insert → XACK → evaluate → anomaly persist flow unaffected.
+
+Validation:
+
+- Inserted a 90-day-old test record (`source='retention_test'`).
+- Restarted worker container.
+- Verified cleanup execution via worker logs.
+- Confirmed record removal (`COUNT(*) = 0`) in PostgreSQL.
+
+Classification:
+
+Infrastructure safety correction aligned with FR-03 data lifecycle
+requirements. No functional ingestion or rule engine behavior changed.

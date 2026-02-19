@@ -85,3 +85,4 @@ volumes:
   redisdata:
   app_node_modules:
   worker_node_modules:
+  dashboard_dist:
