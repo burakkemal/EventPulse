@@ -90,13 +90,12 @@ interface ConsumerDeps {
  * Main consumer loop.
  *
  * 1. XREADGROUP with BLOCK — waits for new messages on the stream.
- * 2. For each message: parse → insert into Postgres (idempotent).
- * 3. After successful insert: evaluate threshold rules → persist anomalies.
- * 4. XACK only after the full pipeline succeeds.
+ * 2. For each message: parse → insert into Postgres (idempotent) → XACK.
+ * 3. After successful insert+ACK: evaluate threshold rules → persist anomalies.
  *
- * Order: DB write → evaluate → anomaly persist → XACK.
+ * Order: DB write → XACK → evaluate → anomaly persist.
  * Never ACK before successful insert.
- * Rule evaluation errors are caught independently and do not prevent XACK.
+ * Rule evaluation is post-ACK and never blocks persistence or acknowledgement.
  *
  * On insert failure the message is NOT acknowledged, so Redis will
  * re-deliver it on the next read cycle (pending entries list).

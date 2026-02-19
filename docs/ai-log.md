@@ -699,3 +699,12 @@ curl -s http://localhost:3000/api/v1/anomalies | jq .
 docker exec eventpulse-db psql -U eventpulse -c "SELECT rule_id, name, enabled, severity FROM rules;"
 docker exec eventpulse-db psql -U eventpulse -c "\di"  # Should show idx_rules_enabled, idx_rules_severity
 ```
+
+### AI Corrections / Fixes → Session 7
+
+**File:** `src/infrastructure/worker/stream-consumer.ts`
+
+- **What was wrong:** During the Phase 7 implementation, XACK was moved to the end of the pipeline (insert → evaluate → anomaly persist → XACK). This coupled acknowledgement to the rule evaluation and anomaly persistence paths. If the worker crashed during rule evaluation or anomaly persistence, the event would be re-delivered and re-evaluated — but more critically, a rule/anomaly failure could delay or prevent XACK, violating the design intent established in Sessions 4–5: rules must be post-ACK and must never block persistence or acknowledgement.
+- **What was changed:** Restored the original ordering: insert → XACK → evaluate → anomaly persist. XACK was moved back inside the persistence `try/catch` block, immediately after `insertEvent()`. The standalone XACK `try/catch` at the end of `processEntry()` was removed. Both the `startConsumer` and `processEntry` docblocks were updated to reflect the correct order.
+- **Files changed:** `src/infrastructure/worker/stream-consumer.ts` (only file modified).
+- **How validated:** Run unit tests (`npm test`) and coverage (`npm run test:coverage`). No test changes required — the fix is in infrastructure code covered by integration testing.
