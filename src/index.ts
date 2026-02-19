@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import { redisPlugin, dbPlugin } from './infrastructure/index.js';
-import { eventRoutes, queryRoutes, ruleRoutes } from './interfaces/http/index.js';
+import { eventRoutes, queryRoutes, ruleRoutes, metricsRoutes } from './interfaces/http/index.js';
 
 /**
  * Bootstrap the Fastify server.
@@ -24,6 +24,7 @@ async function main(): Promise<void> {
   await fastify.register(eventRoutes);
   await fastify.register(queryRoutes);
   await fastify.register(ruleRoutes);
+  await fastify.register(metricsRoutes);
 
   // --- Start ---
   const host = process.env['HOST'] ?? '0.0.0.0';

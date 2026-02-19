@@ -11,3 +11,5 @@ export { createRule, listRules, getRule, updateRuleFull, patchRulePartial, remov
 export { ThresholdEvaluator } from './threshold-evaluator.js';
 export type { ThresholdAnomaly, EvaluatableEvent } from './threshold-evaluator.js';
 export { RuleStore } from './rule-store.js';
+export { getMetrics, resolveWindow, resolveGroupBy } from './metrics.js';
+export type { GetMetricsParams, MetricsResult } from './metrics.js';

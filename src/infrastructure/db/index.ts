@@ -17,4 +17,6 @@ export {
   deleteRule,
 } from './rule-repository.js';
 export type { RuleRow, CreateRuleInput, UpdateRuleInput, PatchRuleInput } from './rule-repository.js';
+export { queryMetrics } from './metrics-repository.js';
+export type { MetricsFilters, MetricsBucket } from './metrics-repository.js';
 export { default as dbPlugin } from './db-plugin.js';

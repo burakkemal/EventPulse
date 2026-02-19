@@ -61,6 +61,7 @@ All test and validation artifacts created/updated with AI assistance across Sess
 | `tests/application/threshold-evaluator.test.ts` | 7 | Unit tests for ThresholdEvaluator (23 tests) |
 | `tests/application/rule-store.test.ts` | 8 | Unit tests for RuleStore atomic swap (6 tests) |
 | `tests/application/rule-subscriber.test.ts` | 8 | Unit tests for rule reload logic (7 tests) |
+| `tests/application/metrics.test.ts` | 9 | Unit tests for metrics use case + validation (18 tests) |
 
 **Runbook corrections applied:** consumer group pre-step (1a), constants table with source references, PowerShell ingestion loop, jq-free alternatives, updated pass/fail criteria.
 

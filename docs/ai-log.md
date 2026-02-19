@@ -818,3 +818,91 @@ sleep 3
 curl -s http://localhost:3000/api/v1/anomalies | jq .
 # Expected: anomaly with the new rule's rule_id
 ```
+
+---
+
+## Session 9 — Metrics Endpoint (P1)
+
+**Date:** 2026-02-19
+
+### Interaction Context (Provided to AI)
+
+- P1 feature: FR-08 Metrics / Aggregates (read-only).
+- Scope: single new endpoint `GET /api/v1/metrics` returning event counts and rates.
+- Queries only the `events` table via Drizzle (no raw SQL).
+- Must use the existing `idx_events_timestamp` index for the time window predicate.
+- No changes to ingestion, worker, rules, anomalies, or existing query endpoints.
+
+### Interaction Summary
+
+Added a metrics endpoint that returns grouped event counts and rates within a sliding time window:
+
+- **Metrics Repository** (`src/infrastructure/db/metrics-repository.ts`): `queryMetrics()` — runs a `SELECT group_col, COUNT(*) FROM events WHERE timestamp BETWEEN from AND to [AND filters] GROUP BY group_col` query using Drizzle. Leverages `idx_events_timestamp` for the time range predicate. Returns `MetricsBucket[]` with `{ key, count }`.
+- **Metrics Use Case** (`src/application/metrics.ts`): `getMetrics()` — computes `from` and `to` timestamps from `window_seconds`, delegates to `queryMetrics()`, and enriches each bucket with `rate_per_sec = count / window_seconds`. Also exports `resolveWindow()` (default 60, min 10, max 3600, null on invalid) and `resolveGroupBy()` (enum: event_type | source, null on invalid) for route-layer validation.
+- **Metrics Routes** (`src/interfaces/http/metrics-routes.ts`): `GET /api/v1/metrics` with querystring validation for `window_seconds` (integer, 10–3600), `group_by` (enum), `event_type` (optional filter), `source` (optional filter). Returns 400 on invalid params. Logs endpoint hit at debug level. Plugin depends on `['db']`.
+- **Server Wiring** (`src/index.ts`): Registered `metricsRoutes` alongside existing route plugins.
+- **Unit Tests** (`tests/application/metrics.test.ts`): 18 tests covering `resolveWindow` (7), `resolveGroupBy` (5), and `getMetrics` (6) — defaults, filter pass-through, rate computation, rounding, window calculation, fallback on invalid params.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Drizzle `count()` + `groupBy()`** | Pure Drizzle query, no raw SQL. Postgres optimizes the GROUP BY using the existing indexes on `event_type` and `source`. |
+| **Indexed timestamp predicate** | `WHERE timestamp >= from AND timestamp <= to` hits `idx_events_timestamp` (B-tree). No full-table scan for default 60s windows. |
+| **Rate computed in application layer** | `count / window_seconds` is a simple division — no reason to push it into SQL. Keeps the repository focused on data retrieval. |
+| **Validation in route layer** | Consistent with existing pattern (query-routes validates limit/offset before use case). Invalid params rejected with 400 before reaching the DB. |
+| **`resolveWindow`/`resolveGroupBy` exported** | Allows route layer to validate early and use case to apply defaults. Also makes both functions independently testable. |
+| **No new indexes** | `idx_events_timestamp` already exists. `event_type` and `source` indexes exist for filter predicates. No schema changes needed. |
+
+### Files Added/Modified
+
+| File | Status |
+|---|---|
+| `src/infrastructure/db/metrics-repository.ts` | New |
+| `src/application/metrics.ts` | New |
+| `src/interfaces/http/metrics-routes.ts` | New |
+| `src/infrastructure/db/index.ts` | Modified (added queryMetrics + types export) |
+| `src/application/index.ts` | Modified (added metrics exports) |
+| `src/interfaces/http/index.ts` | Modified (added metricsRoutes export) |
+| `src/index.ts` | Modified (registered metricsRoutes) |
+| `vitest.config.ts` | Modified (added metrics.ts to coverage) |
+| `tests/application/metrics.test.ts` | New |
+
+### Not Modified
+- Ingestion API, worker, rules CRUD, anomaly pipeline
+- `events` table schema, `anomalies` table, `rules` table
+- Existing query endpoints (`/events`, `/events/:id`, `/anomalies`)
+- Existing tests (all pass without changes)
+
+### Validation Method
+```bash
+# Rebuild containers
+docker compose up -d --build
+
+# Run all tests (existing + new)
+docker exec eventpulse-app npm test
+
+# Coverage (should maintain >80%)
+docker exec eventpulse-app npm run test:coverage
+
+# Sample curl requests:
+
+# Default: 60s window, grouped by event_type
+curl -s http://localhost:3000/api/v1/metrics | jq .
+
+# Custom window and group_by
+curl -s 'http://localhost:3000/api/v1/metrics?window_seconds=300&group_by=source' | jq .
+
+# With filters
+curl -s 'http://localhost:3000/api/v1/metrics?window_seconds=120&event_type=error' | jq .
+
+# Invalid params → 400
+curl -s 'http://localhost:3000/api/v1/metrics?window_seconds=abc' | jq .
+# Expected: { "error": "window_seconds must be an integer" }
+
+curl -s 'http://localhost:3000/api/v1/metrics?group_by=invalid' | jq .
+# Expected: { "error": "group_by must be one of: event_type, source" }
+
+curl -s 'http://localhost:3000/api/v1/metrics?window_seconds=5' | jq .
+# Expected: { "error": "window_seconds must be between 10 and 3600" }
+```
