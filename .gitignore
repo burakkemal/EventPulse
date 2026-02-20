@@ -3,6 +3,5 @@ dist/
 public/dist/
 coverage/
 .vitest/
-.env
 *.log
 .DS_Store
