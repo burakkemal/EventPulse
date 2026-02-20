@@ -2,6 +2,7 @@ import type Redis from 'ioredis';
 import type { Logger } from 'pino';
 import type { Database } from '../db/index.js';
 import type { ThresholdEvaluator } from '../../application/threshold-evaluator.js';
+import type { StatisticalEvaluator } from '../../application/statistical-evaluator.js';
 import type { RuleStore } from '../../application/rule-store.js';
 import { insertEvent, insertAnomaly } from '../db/index.js';
 import { publishAnomalyNotification } from '../redis/anomaly-notifier.js';
@@ -85,6 +86,7 @@ interface ConsumerDeps {
   log: Logger;
   evaluator: ThresholdEvaluator;
   ruleStore: RuleStore;
+  statisticalEvaluator?: StatisticalEvaluator | undefined;
 }
 
 /**
@@ -110,6 +112,7 @@ export async function startConsumer(
   signal: AbortSignal,
   evaluator: ThresholdEvaluator,
   ruleStore: RuleStore,
+  statisticalEvaluator?: StatisticalEvaluator,
 ): Promise<void> {
   const deps: ConsumerDeps = {
     redis,
@@ -117,6 +120,7 @@ export async function startConsumer(
     log,
     evaluator,
     ruleStore,
+    statisticalEvaluator,
   };
 
   await ensureConsumerGroup(redis, log);
@@ -271,6 +275,59 @@ async function processEntry(
     } catch (err: unknown) {
       deps.log.error({ err, event_id: event.event_id, streamId }, 'Failed to evaluate rules');
     }
+  }
+
+  // --- Statistical evaluation boundary (post-ACK, isolated from threshold) ---
+  try {
+    const anomalies = deps.statisticalEvaluator?.evaluateEvent({
+      event_type: event.event_type,
+      source: event.source,
+      timestamp: event.timestamp,
+    }) ?? [];
+
+    deps.log.debug(
+      { event_id: event.event_id, statAnomalyCount: anomalies.length },
+      'Statistical evaluation completed',
+    );
+
+    for (const anomaly of anomalies) {
+      const detectedAtIso = anomaly.detected_at instanceof Date
+        ? anomaly.detected_at.toISOString()
+        : String(anomaly.detected_at);
+
+      deps.log.warn(
+        { rule_id: anomaly.rule_id, severity: anomaly.severity, event_id: event.event_id },
+        `Statistical anomaly detected: [${anomaly.rule_id}] ${anomaly.message}`,
+      );
+
+      try {
+        const anomalyId = await insertAnomaly(deps.db, {
+          event_id: event.event_id,
+          rule_id: anomaly.rule_id,
+          severity: anomaly.severity,
+          message: anomaly.message,
+          detected_at: detectedAtIso,
+        });
+
+        await publishAnomalyNotification(deps.redis, deps.log, {
+          anomaly_id: anomalyId,
+          rule_id: anomaly.rule_id,
+          severity: anomaly.severity,
+          message: anomaly.message,
+          detected_at: detectedAtIso,
+        });
+      } catch (persistErr: unknown) {
+        deps.log.error(
+          { err: persistErr, anomaly_rule_id: anomaly.rule_id, event_id: event.event_id },
+          'Failed to persist statistical anomaly',
+        );
+      }
+    }
+  } catch (err: unknown) {
+    deps.log.warn(
+      { err, event_id: event.event_id },
+      'Statistical evaluation failed',
+    );
   }
 }
 

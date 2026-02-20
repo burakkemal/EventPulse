@@ -16,6 +16,7 @@ export default defineConfig({
         'src/application/threshold-evaluator.ts',
         'src/application/rule-store.ts',
         'src/application/metrics.ts',
+        'src/application/statistical-evaluator.ts',
         'src/infrastructure/rules/**',
         'src/infrastructure/notifications/config.ts',
         'src/infrastructure/notifications/slack.ts',

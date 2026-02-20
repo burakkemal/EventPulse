@@ -13,3 +13,5 @@ export type { ThresholdAnomaly, EvaluatableEvent } from './threshold-evaluator.j
 export { RuleStore } from './rule-store.js';
 export { getMetrics, resolveWindow, resolveGroupBy } from './metrics.js';
 export type { GetMetricsParams, MetricsResult } from './metrics.js';
+export { StatisticalEvaluator } from './statistical-evaluator.js';
+export type { StatisticalAnomaly, StatisticalProfile, StatisticalProfileId, ZScoreDetails, StatisticalEvaluatorOptions, StatisticalEvaluatorLog } from './statistical-evaluator.js';

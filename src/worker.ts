@@ -4,6 +4,8 @@ import { createDbClient, findEnabledRules } from './infrastructure/db/index.js';
 import { startConsumer } from './infrastructure/worker/index.js';
 import { startRuleSubscriber } from './infrastructure/worker/rule-subscriber.js';
 import { ThresholdEvaluator } from './application/threshold-evaluator.js';
+import { StatisticalEvaluator } from './application/statistical-evaluator.js';
+import type { StatisticalProfile } from './application/statistical-evaluator.js';
 import { RuleStore } from './application/rule-store.js';
 
 /**
@@ -138,11 +140,53 @@ async function main(): Promise<void> {
     'Rules loaded from database',
   );
 
+  // ── Statistical evaluator (FR-09 P1 — Z-score spike detection) ──
+  // Hardcoded profiles — no DB schema or rule JSON changes.
+  // Wrapped in try/catch: initialization failure must NOT crash the worker.
+  let statisticalEvaluator: StatisticalEvaluator | undefined;
+  try {
+    const zscoreProfiles: StatisticalProfile[] = [
+      {
+        id: 'zscore-count-spike',
+        bucketSeconds: 10,
+        baselineBuckets: 5,
+        zThreshold: 2.0,
+        cooldownSeconds: 30,
+        // No filters — monitors all event types and sources
+      },
+    ];
+    statisticalEvaluator = new StatisticalEvaluator({
+      profiles: zscoreProfiles,
+      severity: 'warning',
+      log: { debug: (obj, msg) => log.debug(obj, msg) },
+    });
+    log.info(
+      { profileCount: zscoreProfiles.length, profiles: zscoreProfiles.map((p) => p.id) },
+      'Statistical evaluator initialized',
+    );
+  } catch (err: unknown) {
+    log.error({ err }, 'Statistical evaluator initialization failed — continuing without statistical detection');
+    // Report degraded health — statistical detection unavailable
+    await redis.set('worker:health', 'degraded', 'EX', 120).catch(() => {});
+  }
+
   // Subscribe to rule change notifications for hot reload.
   // Uses a dedicated Redis connection (ioredis subscribe requirement).
   cleanupSubscriber = await startRuleSubscriber(redisUrl, db, log, ruleStore, ac.signal);
 
-  await startConsumer(redis, db, log, ac.signal, evaluator, ruleStore);
+  // Report worker health to Redis (TTL auto-expires if worker dies).
+  // Refresh every 60s; key expires after 120s if worker stops.
+  const workerHealthValue = statisticalEvaluator ? 'ok' : 'degraded';
+  await redis.set('worker:health', workerHealthValue, 'EX', 120).catch(() => {});
+  const healthInterval = setInterval(() => {
+    redis.set('worker:health', workerHealthValue, 'EX', 120).catch(() => {});
+  }, 60_000);
+  log.info({ workerHealth: workerHealthValue }, 'Worker health reported to Redis');
+
+  // Clear heartbeat on shutdown
+  ac.signal.addEventListener('abort', () => clearInterval(healthInterval));
+
+  await startConsumer(redis, db, log, ac.signal, evaluator, ruleStore, statisticalEvaluator);
 }
 
 // Graceful shutdown on SIGINT / SIGTERM

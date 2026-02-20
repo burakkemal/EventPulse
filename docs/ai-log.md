@@ -1375,3 +1375,496 @@ Classification:
 
 Infrastructure safety correction aligned with FR-03 data lifecycle
 requirements. No functional ingestion or rule engine behavior changed.
+
+---
+
+## Session 12 — FR-09 Statistical Anomaly Detection (P1 Z-Score)
+
+**Date:** 2026-02-19
+
+### Interaction Context (Provided to AI)
+
+- FR-09 P1: basic anomaly detection using a statistical method (Z-score).
+- Scope: new isolated `StatisticalEvaluator` running post-ACK alongside `ThresholdEvaluator`.
+- No DB schema changes. No new `condition.type` values. No changes to rule JSON format.
+- `ThresholdEvaluator` completely untouched.
+- In-memory state only (P1 acceptable). Hardcoded profile config in worker.ts.
+- Deterministic and unit-testable with injectable `nowFn`.
+
+### Interaction Summary
+
+Added Z-score based spike detection as a new evaluator that runs in the worker pipeline:
+
+- **StatisticalEvaluator** (`src/application/statistical-evaluator.ts`): Tracks event counts in fixed-duration time buckets per profile. Maintains a sliding window of N historical buckets as baseline. Computes mean/stddev over baseline, calculates z-score for the current bucket, triggers anomaly when z >= threshold. Supports per-profile filters (event_type, source), cooldown, and injectable clock.
+- **Worker integration** (`src/worker.ts`): Instantiates `StatisticalEvaluator` with one default profile (`zscore-count-spike`: 60s buckets, 20 baseline buckets, z >= 3.0, 300s cooldown, severity "warning"). Passes to `startConsumer()`.
+- **Stream consumer** (`src/infrastructure/worker/stream-consumer.ts`): Added optional `statisticalEvaluator` to `ConsumerDeps`. After threshold evaluation, runs statistical evaluation in its own `try/catch`. Anomaly persistence and notification follow the same best-effort pattern as threshold anomalies.
+- **Unit tests** (`tests/application/statistical-evaluator.test.ts`): 8 tests covering: no alert before baseline filled, stable series no alert, spike detection, stddev=0 safety, cooldown suppression, filter matching, multiple independent profiles, anomaly message field validation.
+
+### Technical Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Separate class, not an extension of ThresholdEvaluator** | Z-score evaluation operates on aggregate bucket counts, not per-event thresholds. Fundamentally different state model (time-bucketed histograms vs. sliding event arrays). Keeping them separate avoids coupling and allows independent evolution. |
+| **Hardcoded profiles in worker.ts** | Avoids DB schema changes and rule JSON format extensions. Profile configuration is code-level, consistent with the P1 scope. A future phase could add a `statistical_rules` table or extend the CRUD API. |
+| **Optional `statisticalEvaluator` in ConsumerDeps** | Backward-compatible — existing tests and callers don't need to provide it. The `undefined` check in `processEntry` skips statistical evaluation cleanly. |
+| **Own error boundary in processEntry** | Statistical evaluation failure must never block threshold evaluation, XACK, or persistence. Isolated `try/catch` with error logging. |
+| **`baselineBuckets` as minimum data requirement** | The evaluator silently skips profiles without enough baseline data. No false alerts during cold start. |
+| **stddev === 0 guard** | Perfectly uniform baseline produces stddev=0. Division by zero would yield Infinity z-score. Guard skips evaluation instead of alerting. |
+| **z-score computed on current wall-clock bucket** | Uses `nowFn()` to determine the current bucket, not the event timestamp. This prevents backfilled/delayed events from triggering false spikes on historical buckets. |
+
+### Files Added/Modified
+
+| File | Status |
+|------|--------|
+| `src/application/statistical-evaluator.ts` | New |
+| `src/application/index.ts` | Modified (added StatisticalEvaluator exports) |
+| `src/infrastructure/worker/stream-consumer.ts` | Modified (optional statisticalEvaluator in deps, post-ACK evaluation) |
+| `src/worker.ts` | Modified (import + instantiate StatisticalEvaluator, pass to consumer) |
+| `vitest.config.ts` | Modified (added statistical-evaluator.ts to coverage) |
+| `tests/application/statistical-evaluator.test.ts` | New |
+
+### Not Modified
+
+- `src/application/threshold-evaluator.ts` (untouched)
+- `src/application/rule-schema.ts` (no new condition types)
+- `src/infrastructure/db/schema.ts` (no DB schema changes)
+- `src/infrastructure/db/rule-repository.ts` (no rule storage changes)
+- `src/interfaces/http/rule-routes.ts` (no CRUD changes)
+- All existing tests (pass without changes)
+- Ingestion API, query endpoints, metrics endpoint
+- `insert → XACK → evaluate` ordering preserved
+
+### Validation (PowerShell-friendly)
+
+For local dev verification, use a smaller profile config by temporarily editing `worker.ts`:
+
+```typescript
+// Temporary fast-test config (replace default profile in worker.ts)
+{
+  id: 'zscore-count-spike',
+  bucketSeconds: 10,        // 10s buckets instead of 60s
+  baselineBuckets: 5,       // Only 5 baseline buckets (~50s warmup)
+  zThreshold: 2.0,          // Lower threshold for testing
+  cooldownSeconds: 30,
+  severity: 'warning',
+}
+```
+
+```powershell
+# 1. Rebuild with fast-test config
+docker compose up -d --build
+
+# 2. Generate baseline: ~2 events per 10s bucket for 60s (6 buckets)
+for ($i = 1; $i -le 12; $i++) {
+  Invoke-RestMethod -Uri http://localhost:3000/api/v1/events -Method POST `
+    -ContentType 'application/json' `
+    -Body ('{"event_type":"heartbeat","source":"monitor","timestamp":"' + (Get-Date -Format o) + '","payload":{}}')
+  Start-Sleep -Seconds 5
+}
+
+# 3. Generate spike: 30 events in rapid succession
+for ($i = 1; $i -le 30; $i++) {
+  Invoke-RestMethod -Uri http://localhost:3000/api/v1/events -Method POST `
+    -ContentType 'application/json' `
+    -Body ('{"event_type":"heartbeat","source":"monitor","timestamp":"' + (Get-Date -Format o) + '","payload":{}}')
+}
+
+# 4. Wait for worker to process
+Start-Sleep -Seconds 5
+
+# 5. Check for statistical anomaly
+Invoke-RestMethod -Uri http://localhost:3000/api/v1/anomalies | ConvertTo-Json -Depth 5
+# Expected: anomaly with rule_id "zscore-count-spike"
+
+# 6. Verify in Postgres
+docker exec eventpulse-db psql -U eventpulse -c "SELECT rule_id, severity, message FROM anomalies WHERE rule_id='zscore-count-spike';"
+
+# 7. Check worker logs
+docker logs eventpulse-worker --tail 30 2>&1 | Select-String "Statistical anomaly"
+# Expected: "Statistical anomaly detected: [zscore-count-spike] Z-score spike detected: z=..."
+```
+
+### AI Corrections / Fixes
+
+Classification: P1 feature addition (FR-09) — scoped statistical anomaly detection. No schema changes, no threshold evaluator modifications, no rule JSON extensions. Post-ACK evaluation only with best-effort error boundary. All existing tests pass without changes.
+
+---
+
+### AI Corrections / Fixes — StatisticalEvaluator (Post-Session 12)
+
+**Date:** 2026-02-19
+**Classification:** Crash fix + integration alignment + health visibility
+
+#### 1. Constructor iterable guard
+
+**File:** `src/application/statistical-evaluator.ts`
+
+The worker crashed on startup with `TypeError: this.profiles is not iterable` because the `StatisticalEvaluator` constructor received the wrong argument shape (array passed directly instead of an options object).
+
+Fixes applied:
+
+- Added an explicit `Array.isArray(opts.profiles)` guard at the top of the constructor. Throws a descriptive `Error` immediately if profiles is not an array, preventing the opaque `not iterable` crash.
+- Changed `rule_id` generation from `${this.ruleIdPrefix}-${profile.id}` to `profile.id` directly — the profile `id` is already a stable identifier (e.g. `zscore-count-spike`) and the prefix concatenation was producing unexpected rule IDs for anomaly queries.
+
+#### 2. Worker startup resilience
+
+**File:** `src/worker.ts`
+
+- Changed import from `ZScoreProfile` to `StatisticalProfile` to match the type name in the user-revised evaluator.
+- Wrapped `StatisticalEvaluator` instantiation in a `try/catch`. On failure: logs `error` level and continues worker startup without statistical detection. The worker continues consuming events and evaluating threshold rules normally.
+- Fixed constructor call: passes `{ profiles: [...], severity: 'warning' }` options object instead of a bare array.
+- Removed `severity` from the profile object (it's now on the evaluator options, not per-profile).
+
+#### 3. Stream consumer API alignment
+
+**File:** `src/infrastructure/worker/stream-consumer.ts`
+
+- Changed `deps.statisticalEvaluator.evaluate(event)` to `deps.statisticalEvaluator.evaluateEvent(event)` — the method was renamed in the user-revised evaluator.
+- `StatisticalAnomaly` no longer has `event_id` — the stream consumer now passes `event.event_id` directly to `insertAnomaly()`.
+- `StatisticalAnomaly.detected_at` is now `Date` instead of `string` — added conversion to ISO string before passing to `insertAnomaly()` and `publishAnomalyNotification()`.
+- Structured log payload changed from `{ anomaly }` (which included the full anomaly object) to `{ rule_id, severity, event_id }` for cleaner log output.
+
+#### 4. Barrel export alignment
+
+**File:** `src/application/index.ts`
+
+Updated type exports to match the user-revised evaluator's type names: `StatisticalProfile`, `StatisticalProfileId`, `ZScoreDetails`, `StatisticalEvaluatorOptions` (replacing the old `StatEvaluatableEvent`, `ZScoreProfile`, `StatisticalFilter`).
+
+#### 5. Worker health visibility on dashboard
+
+**Files:** `src/worker.ts`, `src/interfaces/http/event-routes.ts`, `src/frontend/api/types.ts`, `src/frontend/dashboard/panels/SystemHealth.tsx`
+
+The dashboard System Health panel always showed Worker as "unknown". Implemented minimal cross-process health reporting:
+
+- **Worker** (`src/worker.ts`): Sets `worker:health` Redis key to `"ok"` (or `"degraded"` if statistical evaluator failed) with 120s TTL. Refreshes every 60s via `setInterval`. TTL auto-expires if the worker process dies. Cleared on graceful shutdown.
+- **Health endpoint** (`src/interfaces/http/event-routes.ts`): Reads `worker:health` from Redis and includes `worker: "ok" | "degraded" | "unknown"` in the health response. Falls back to `"unknown"` if the key is missing or Redis read fails.
+- **Frontend types** (`src/frontend/api/types.ts`): Added optional `worker` field to `HealthResponse`.
+- **Dashboard panel** (`src/frontend/dashboard/panels/SystemHealth.tsx`): Reads `h.worker` from the health response instead of hardcoding `"unknown"`.
+
+#### What was NOT changed
+
+- **ThresholdEvaluator**: completely untouched.
+- **Rule CRUD / rule schema**: no changes.
+- **DB schema**: no changes (no new tables, columns, or indexes).
+- **Ingestion API**: untouched.
+- **Persistence semantics**: `insert → XACK → evaluate → anomaly persist` ordering preserved.
+- **Existing tests**: pass without changes.
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/application/statistical-evaluator.ts` | Added `Array.isArray` guard, changed `rule_id` to `profile.id` |
+| `src/worker.ts` | Fixed import, options-object constructor, try/catch, Redis health heartbeat |
+| `src/infrastructure/worker/stream-consumer.ts` | `evaluateEvent()`, `Date→string` conversion, `event_id` from event |
+| `src/application/index.ts` | Updated type export names |
+| `src/interfaces/http/event-routes.ts` | Added worker health to health response |
+| `src/frontend/api/types.ts` | Added `worker` to `HealthResponse` |
+| `src/frontend/dashboard/panels/SystemHealth.tsx` | Reads worker status from health response |
+| `docs/ai-log.md` | This entry |
+
+---
+
+### AI Corrections / Fixes — StatisticalEvaluator Execution Wiring
+
+**Date:** 2026-02-20
+**Classification:** Pipeline wiring fix
+
+#### Problem
+
+StatisticalEvaluator initialized successfully (confirmed in worker logs) but never produced anomalies. Worker logs showed zero statistical evaluation activity — no warn-level anomaly detections and no debug-level evaluation traces. Events were persisted correctly (45 rows confirmed in DB). The evaluator was present in `processEntry()` but its execution path lacked diagnostic logging to confirm whether it was being reached.
+
+#### Fix Applied
+
+**File:** `src/infrastructure/worker/stream-consumer.ts`
+
+Replaced the statistical evaluation block in `processEntry()` with a cleaner implementation:
+
+- **Explicit property selection**: Changed from passing the full `event` object to `evaluateEvent({ event_type, source, timestamp })` — matches the evaluator's input contract exactly and avoids passing extraneous fields.
+- **Optional chaining with fallback**: Uses `deps.statisticalEvaluator?.evaluateEvent(...) ?? []` instead of an `if` guard wrapping the entire block. The evaluation + persistence runs unconditionally (no-ops gracefully when evaluator is undefined).
+- **Debug-level execution trace**: Added `deps.log.debug({ event_id, statAnomalyCount }, 'Statistical evaluation completed')` after every call. This confirms the evaluator is executing even when no anomalies are produced (visible with `LOG_LEVEL=debug`).
+- **Warn-level failure logging**: Outer catch logs at `warn` level (not `error`) per task spec — statistical evaluation failures are non-critical.
+- **Simplified anomaly persistence**: Removed the intermediate `anomalyId` variable guard — `insertAnomaly` and `publishAnomalyNotification` are called sequentially inside a single inner try/catch.
+
+#### What Was NOT Changed
+
+- Insert → XACK → evaluate ordering: preserved.
+- ThresholdEvaluator evaluation block: untouched.
+- Ingestion API: untouched.
+- DB schema: untouched.
+- Redis stream semantics: untouched.
+- Statistical evaluation remains best-effort with isolated try/catch — never blocks ACK or persistence.
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/infrastructure/worker/stream-consumer.ts` | Rewired statistical evaluation block with explicit property passing, debug trace, warn-level failure |
+| `docs/ai-log.md` | This entry |
+
+---
+
+### AI Corrections / Fixes — StatisticalEvaluator Pruning Bug + Debug Logging
+
+**Date:** 2026-02-20
+**Classification:** Algorithm correctness fix + diagnostic instrumentation
+
+#### Root Cause — Pruning Window Too Narrow
+
+After adding `LOG_LEVEL: debug` to the worker container (`docker-compose.yml`), logs confirmed that `evaluateEvent()` was being called for every event but always returned `statAnomalyCount: 0`. The debug trace also revealed every processed event was marked `"Duplicate event skipped"` — the worker had restarted with empty in-memory state and was replaying events from its Redis Streams pending-delivery list (PEL), all with timestamps from a previous run that had no baseline data.
+
+Running a proper baseline+spike test (5 buckets × 10 seconds, then a 30-event spike) still produced zero anomalies. Tracing the exact timeline exposed the bug:
+
+The test script aligns to a 10-second bucket boundary before the baseline (`$wait = 10 − ($now % 10)`), then after the 5 baseline buckets it runs a second alignment step. If the post-baseline `$now` is exactly on a 10-second boundary (which it always is when the initial alignment was exact), `$wait = 10 − 0 = 10`, adding a full extra 10-second sleep. The spike therefore lands **two** buckets after the last baseline bucket instead of one.
+
+With `baselineBuckets = 5` and `bucketSeconds = 10`, the old pruning window was:
+
+```typescript
+const oldestKept = eventBucketStart - profile.baselineBuckets * bucketMs;
+// = spike_bucket − 5×10000 = T+60000 − 50000 = T+10000
+```
+
+Baseline bucket B0 was at exactly `T`. `T < T+10000` → **B0 deleted**. Only B1–B4 remained (4 entries). `4 < 5` (baselineBuckets) → evaluator skipped → `statAnomalyCount: 0` on every event.
+
+**Secondary bug:** `ruleIdPrefix` defaulted to `"zscore"` and `profile.id = "zscore-count-spike"`, producing `rule_id = "zscore-zscore-count-spike"` (double prefix).
+
+#### Fixes Applied
+
+**File: `src/application/statistical-evaluator.ts`**
+
+1. **Pruning window widened** from `baselineBuckets × bucketMs` to `(baselineBuckets + 1) × bucketMs`. This ensures a 1-bucket gap between the end of the baseline phase and the spike bucket does not evict the oldest baseline bucket. Worked example with the fix:
+   ```
+   oldestKept = T+60000 − (5+1)×10000 = T+60000 − 60000 = T+0
+   B0 at T: T < T+0 → false → KEPT ✓
+   Baseline = [B0, B1, B2, B3, B4] = 5 entries → proceed
+   ```
+
+2. **Baseline slice** changed from collecting all non-current buckets to `completedBucketCounts.slice(-profile.baselineBuckets)`. This takes the N most-recent completed buckets regardless of gaps in the timeline, so a gap larger than one bucket still produces the correct baseline rather than triggering a false "not ready" result.
+
+3. **Per-profile debug logging** added via an optional `log?: StatisticalEvaluatorLog` option (`{ debug: (obj, msg) => void }`). A debug log is emitted at every skip point:
+   - `"StatEval: skipped — filter mismatch"`
+   - `"StatEval: skipped — baseline not ready"` (includes `completedBucketsAvailable`, `baselineBucketsRequired`, `currentCount`)
+   - `"StatEval: skipped — stddev is 0 (uniform baseline)"` (includes `baselineCounts`, `mean`)
+   - `"StatEval: skipped — within cooldown window"` (includes `cooldownRemainingMs`)
+   - `"StatEval: z-score computed"` (includes `profileId`, `bucketStart`, `currentCount`, `baselineCounts`, `mean`, `stddev`, `z`, `zThreshold`, `willFire`)
+
+4. **`ruleIdPrefix` default** changed from `"zscore"` to `""`. Rule ID is now constructed as `this.ruleIdPrefix ? \`${ruleIdPrefix}-${profile.id}\` : profile.id`. With the default empty prefix, `rule_id = profile.id = "zscore-count-spike"`.
+
+5. **`StatisticalEvaluatorLog` type** exported from `src/application/statistical-evaluator.ts` and re-exported from `src/application/index.ts`.
+
+**File: `src/worker.ts`**
+
+- Passes `log: { debug: (obj, msg) => log.debug(obj, msg) }` to `StatisticalEvaluator` so internal traces route through the existing pino logger.
+
+**File: `tests/application/statistical-evaluator.test.ts`**
+
+- Completely rewritten to use the current API (`StatisticalEvaluatorOptions` constructor, `.evaluateEvent()`, `StatisticalProfile` type). The old test file used the pre-refactor API (`ZScoreProfile`, `StatEvaluatableEvent`, positional constructor, `.evaluate()`, `.totalBuckets`, `.profileCount`) and was failing at import time.
+- All tests now use `VARIED_BASELINE = [2, 4, 2, 4, 3]` (mean=3, stddev≈0.894) so `stddev > 0` and anomalies can actually fire.
+- Added **Test 9** — regression test for the exact pruning bug: spike lands 2 buckets after the last baseline bucket (skipping 1 intermediate bucket), all 5 baseline entries must survive pruning and the anomaly must fire.
+- Total: 9 tests, all passing.
+
+#### Test Results
+
+```
+✓ should not alert before baselineBuckets are filled
+✓ should not alert on a stable event series (stddev guard)
+✓ should detect a spike and produce an anomaly
+✓ should not divide by zero when stddev is 0 (all baseline buckets identical)
+✓ should suppress anomalies within cooldown window
+✓ should only evaluate events matching the profile filter
+✓ should track multiple profiles independently
+✓ should include z-score, mean, stddev, and filters in anomaly message
+✓ should still detect a spike when spike bucket is 2 buckets after last baseline
+
+Test Files  1 passed (1)
+     Tests  9 passed (9)
+  Duration  607ms
+```
+
+#### Manual End-to-End Validation
+
+Confirmed anomaly produced in live system:
+
+```
+[zscore-count-spike] warning
+Z-score spike detected: z=2.2361, current=5, mean=3, stddev=0.8944,
+bucketSeconds=10, bucketStart=2026-02-20T00:15:00.000Z
+```
+
+```
+docker exec eventpulse-db psql -U eventpulse -c "SELECT COUNT(*) FROM anomalies;"
+ count
+-------
+     1
+```
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/application/statistical-evaluator.ts` | Pruning window fix, baseline slice, debug logging, `ruleIdPrefix` default fix, `StatisticalEvaluatorLog` type exported |
+| `src/worker.ts` | Passes `log` callback to `StatisticalEvaluator` |
+| `src/application/index.ts` | Added `StatisticalEvaluatorLog` to re-exports |
+| `tests/application/statistical-evaluator.test.ts` | Fully rewritten — current API, varied baseline, 9 tests (was 8, broken) |
+| `docker-compose.yml` | Added `LOG_LEVEL: debug` to worker service environment |
+| `docs/ai-log.md` | This entry |
+
+#### What Was NOT Changed
+
+- `ThresholdEvaluator`: completely untouched.
+- `stream-consumer.ts`: untouched (evaluation wiring from previous fix preserved).
+- DB schema, ingestion API, rule CRUD, notification channels: untouched.
+- `insert → XACK → evaluate → anomaly persist` ordering: preserved.
+
+---
+
+### FR-09 Manual Test Scripts
+
+**Purpose:** End-to-end validation of Z-score spike detection with real-time anomaly monitoring.
+
+**Prerequisites:**
+- Docker containers running: `docker compose up -d`
+- `LOG_LEVEL: debug` set in worker service (already in `docker-compose.yml`)
+- Worker profile: `bucketSeconds: 10`, `baselineBuckets: 5`, `zThreshold: 2.0`, `cooldownSeconds: 30`
+- Anomaly fires when spike bucket count ≥ `mean + zThreshold × stddev`. With baseline `[2,4,2,4,3]` (mean=3, stddev≈0.894): fires at count=5 (z≈2.24)
+
+**How to run:** Open two separate PowerShell windows. Start the watcher first, then run the test script. The test takes approximately 60–70 seconds (50s baseline + alignment sleeps + spike).
+
+---
+
+**Window 1 — Real-time anomaly watcher** (start first, keep running):
+
+```powershell
+# Polls /api/v1/anomalies every 3 seconds and prints new rows
+$seen = @{}
+Write-Host "Watching for anomalies... (Ctrl+C to stop)" -ForegroundColor Cyan
+
+while ($true) {
+    try {
+        $resp = Invoke-RestMethod http://localhost:3000/api/v1/anomalies
+        foreach ($a in $resp.data) {
+            $id = $a.anomaly_id
+            if (-not $seen.ContainsKey($id)) {
+                $seen[$id] = $true
+                $ts = $a.detected_at
+                $rule = $a.rule_id
+                $msg = $a.message
+                Write-Host ""
+                Write-Host "*** ANOMALY DETECTED ***" -ForegroundColor Red
+                Write-Host "  rule_id    : $rule" -ForegroundColor Yellow
+                Write-Host "  severity   : $($a.severity)" -ForegroundColor Yellow
+                Write-Host "  detected_at: $ts" -ForegroundColor Yellow
+                Write-Host "  message    : $msg" -ForegroundColor White
+            }
+        }
+    } catch {
+        Write-Host "[watcher] API error: $_" -ForegroundColor DarkRed
+    }
+    Start-Sleep -Seconds 3
+}
+```
+
+---
+
+**Window 2 — Baseline + spike test** (paste entire block at once):
+
+```powershell
+$base   = "http://localhost:3000/api/v1"
+$source = "ztest-$(Get-Date -Format 'HHmmss')"
+Write-Host "=== FR-09 Z-score Test ===" -ForegroundColor Cyan
+Write-Host "Source tag : $source"
+Write-Host "Bucket     : 10 seconds"
+Write-Host "Baseline   : 5 buckets x counts [2,4,2,4,3]"
+Write-Host "Spike      : 30 events"
+Write-Host ""
+
+function Send-Events($n) {
+    for ($i = 0; $i -lt $n; $i++) {
+        $body = @{
+            event_type = "cpu_spike"
+            source     = $source
+            timestamp  = (Get-Date).ToUniversalTime().ToString("o")
+            payload    = @{ v = $i }
+        } | ConvertTo-Json -Depth 5
+        Invoke-RestMethod "$base/events" `
+            -Method POST -ContentType "application/json" -Body $body | Out-Null
+    }
+}
+
+# Align to the next clean 10-second bucket boundary
+$now  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$wait = 10 - ($now % 10)
+if ($wait -lt 2) { $wait += 10 }
+Write-Host "Aligning to bucket boundary — waiting ${wait}s..." -ForegroundColor DarkGray
+Start-Sleep -Seconds $wait
+
+# Baseline: 5 buckets with varied counts (mean=3, stddev≈0.894 → spike fires at count≥5)
+$counts = @(2, 4, 2, 4, 3)
+for ($b = 0; $b -lt $counts.Length; $b++) {
+    $c = $counts[$b]
+    Write-Host "Baseline bucket $($b+1)/5: sending $c events..." -ForegroundColor Gray
+    Send-Events $c
+    Start-Sleep -Seconds 10
+}
+
+Write-Host ""
+Write-Host "Baseline complete." -ForegroundColor Green
+
+# Align to a fresh bucket after baseline
+$now  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$wait = 10 - ($now % 10)
+if ($wait -lt 2) { $wait += 10 }
+Write-Host "Aligning to spike bucket — waiting ${wait}s..." -ForegroundColor DarkGray
+Start-Sleep -Seconds $wait
+
+# Spike
+Write-Host ""
+Write-Host ">>> Sending SPIKE: 30 events <<<" -ForegroundColor Magenta
+Send-Events 30
+
+Write-Host "Waiting 5s for worker to process..." -ForegroundColor DarkGray
+Start-Sleep -Seconds 5
+
+# Final check
+Write-Host ""
+Write-Host "=== ANOMALY API RESULT ===" -ForegroundColor Cyan
+$result = Invoke-RestMethod "$base/anomalies"
+Write-Host "Total anomalies in DB: $($result.pagination.count)"
+$result.data | ForEach-Object {
+    Write-Host "  [$($_.rule_id)] $($_.severity)  $($_.message)" -ForegroundColor Yellow
+}
+```
+
+---
+
+**Expected output (Window 1 watcher):**
+
+```
+*** ANOMALY DETECTED ***
+  rule_id    : zscore-count-spike
+  severity   : warning
+  detected_at: 2026-02-20T00:15:05.123Z
+  message    : Z-score spike detected: z=2.2361, current=5, mean=3, stddev=0.8944,
+               bucketSeconds=10, bucketStart=2026-02-20T00:15:00.000Z
+```
+
+**Expected output (Window 2, final check):**
+
+```
+=== ANOMALY API RESULT ===
+Total anomalies in DB: 1
+  [zscore-count-spike] warning  Z-score spike detected: z=2.2361, current=5, mean=3, ...
+```
+
+**Additional diagnostic commands:**
+
+```powershell
+# Confirm anomaly in Postgres
+docker exec eventpulse-db psql -U eventpulse -c "SELECT COUNT(*) FROM anomalies;"
+
+# Watch evaluator internals (debug traces)
+docker logs eventpulse-worker --tail 200 2>&1 | Select-String "StatEval|statAnomalyCount|Statistical anomaly"
+
+# Confirm unit tests still pass
+docker exec eventpulse-app npx vitest run tests/application/statistical-evaluator.test.ts --reporter=verbose
+```

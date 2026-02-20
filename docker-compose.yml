@@ -70,6 +70,7 @@ services:
       DATABASE_URL: postgres://eventpulse:eventpulse_dev@postgres:5432/eventpulse
       WORKER_ID: worker-1
       NODE_ENV: development
+      LOG_LEVEL: debug
     depends_on:
       redis:
         condition: service_healthy

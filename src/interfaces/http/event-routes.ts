@@ -96,16 +96,30 @@ async function eventRoutes(fastify: FastifyInstance): Promise<void> {
 
   /**
    * Health check — verifies Redis is reachable via PING.
+   * Also reports worker status via a Redis key set by the worker process.
+   * Worker sets `worker:health` with a TTL; if missing, worker is down.
    */
   fastify.get(
     '/api/v1/events/health',
     async (_request: FastifyRequest, reply: FastifyReply) => {
       try {
         const pong = await fastify.redis.ping();
-        return reply.status(200).send({ status: 'ok', redis: pong });
+
+        // Read worker health from Redis (set by worker process with TTL)
+        let worker: 'ok' | 'degraded' | 'unknown' = 'unknown';
+        try {
+          const workerHealth = await fastify.redis.get('worker:health');
+          if (workerHealth === 'ok') worker = 'ok';
+          else if (workerHealth === 'degraded') worker = 'degraded';
+          // null = key expired or never set → worker is down/unknown
+        } catch {
+          // Redis read failed — worker status unknown
+        }
+
+        return reply.status(200).send({ status: 'ok', redis: pong, worker });
       } catch (err: unknown) {
         fastify.log.error({ err }, 'Redis health check failed');
-        return reply.status(503).send({ status: 'degraded', redis: 'unreachable' });
+        return reply.status(503).send({ status: 'degraded', redis: 'unreachable', worker: 'unknown' });
       }
     },
   );

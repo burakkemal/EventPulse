@@ -48,4 +48,5 @@ export interface MetricsResponse {
 export interface HealthResponse {
   status: 'ok' | 'degraded';
   redis: string;
+  worker?: 'ok' | 'degraded' | 'unknown';
 }

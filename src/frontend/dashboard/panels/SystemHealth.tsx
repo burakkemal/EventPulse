@@ -24,7 +24,7 @@ export function SystemHealth() {
     { label: 'API', status: h ? 'ok' : 'unknown' },
     { label: 'Redis', status: h ? h.status : 'unknown' },
     { label: 'Database', status: h ? 'ok' : 'unknown' },
-    { label: 'Worker', status: 'unknown' },
+    { label: 'Worker', status: h?.worker === 'ok' ? 'ok' : h?.worker === 'degraded' ? 'degraded' : 'unknown' },
   ];
 
   return (
