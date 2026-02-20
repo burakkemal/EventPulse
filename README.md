@@ -209,6 +209,9 @@ AI Interaction Log:
 
 docs/ai-log.md
 
+Swagger : 
+Interactive API specification is available via docs/swagger.yaml.
+
 ------------------------------------------------------------------------
 
 # License

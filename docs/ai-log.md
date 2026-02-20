@@ -1282,3 +1282,57 @@ docker exec eventpulse-app npx vitest run tests/application/statistical-evaluato
 *Total interactions documented: 22 (AI-001 through AI-022)*
 *Date range: 2026-02-17 — 2026-02-20*
 *Tool used throughout: ChatGPT GPT-5.2 , Claude 4.6 Sonnet*
+
+
+
+---
+
+## Interaction ID: AI-023
+
+**Timestamp:** 2026-02-20 13:40 PM (estimated)
+
+**Tool Used:**
+ChatGPT GPT-5.2 — Architecture Discussion, Documentation Guidance  
+Claude 4.6 Sonnet — Code Analysis and Documentation Generation
+
+**Task Category:** Documentation / Debugging / API Documentation
+
+---
+
+### Prompt (summarized)
+
+"Generate Swagger (OpenAPI) documentation and API reference based strictly on existing Fastify routes without modifying application behavior. Resolve Swagger UI loading issues and browser CORS preflight failures while keeping ingestion and persistence semantics unchanged."
+
+---
+
+### AI Output Summary
+
+AI assisted in generating OpenAPI documentation derived from Fastify route handlers and validation schemas. Guidance was also provided for configuring Swagger UI using a dedicated container and identifying the root cause of browser preflight (OPTIONS) failures caused by missing CORS handling.
+
+---
+
+### Your Modifications
+
+- Added Swagger UI container to docker-compose configuration.
+- Corrected swagger-initializer configuration to prevent Docker injection errors.
+- Fixed container restart loop caused by bind-mounted initializer conflicts.
+- Implemented Fastify CORS handling to properly respond to OPTIONS preflight requests from Swagger UI.
+- Verified endpoints and responses against existing handlers to ensure no undocumented behavior was introduced.
+
+---
+
+### Validation Method
+
+- docker compose up -d --build
+- Verified Swagger UI accessibility at http://localhost:8081
+- Inspected container logs using `docker logs eventpulse-swagger`
+- Browser DevTools Network inspection confirmed OPTIONS preflight returned successful response.
+- Executed endpoint calls through Swagger "Try it out" functionality.
+
+---
+
+### Quality Rating
+
+5 / 5 — AI significantly accelerated documentation generation and troubleshooting while final configuration decisions and validation were performed manually.
+
+---

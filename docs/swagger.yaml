@@ -1,0 +1,1304 @@
+openapi: 3.1.0
+
+info:
+  title: EventPulse API
+  version: 1.0.0
+  description: >
+    Real-time event ingestion and anomaly detection API.
+    Events are submitted via HTTP, enqueued to Redis Streams (fire-and-forget),
+    persisted to PostgreSQL by a background worker, and evaluated against
+    threshold and statistical rules. Detected anomalies are broadcast over
+    WebSocket.
+
+    **Note:** Every endpoint, field, status code, and schema in this document
+    is derived directly from the Fastify route handlers, Zod schemas, and
+    Drizzle ORM schema in this repository.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Events
+    description: >
+      Event ingestion (POST) and read-only event queries (GET).
+      Ingestion endpoints are fire-and-forget — 202 Accepted means enqueued,
+      not persisted.
+  - name: Anomalies
+    description: Read-only anomaly query endpoint.
+  - name: Rules
+    description: >
+      CRUD management of threshold rules. Rules are stored in PostgreSQL,
+      loaded by the worker on startup, and hot-reloaded via Redis Pub/Sub.
+  - name: Metrics
+    description: Aggregated event count and rate metrics over a sliding time window.
+  - name: Health
+    description: Service health check.
+
+paths:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Events — ingestion
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /api/v1/events:
+    post:
+      operationId: ingestEvent
+      tags: [Events]
+      summary: Ingest a single event
+      description: >
+        Validates the request body, assigns a server-generated `event_id` if
+        not supplied, and enqueues the event to Redis Streams (fire-and-forget).
+        Returns 202 immediately without waiting for persistence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventInput'
+            example:
+              event_type: page_view
+              source: web-frontend
+              timestamp: "2026-02-20T12:00:00.000Z"
+              payload:
+                url: /dashboard
+                user_agent: Mozilla/5.0
+              metadata:
+                trace_id: abc-123
+      responses:
+        "202":
+          description: Event accepted and enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestAccepted'
+              example:
+                status: accepted
+                event_id: 550e8400-e29b-41d4-a716-446655440000
+        "400":
+          description: Request body failed Zod validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationErrorResponse'
+              example:
+                error: Validation failed
+                issues:
+                  - code: invalid_type
+                    expected: string
+                    received: undefined
+                    path: [event_type]
+                    message: Required
+
+    get:
+      operationId: listEvents
+      tags: [Events]
+      summary: List events (paginated + filtered)
+      description: >
+        Returns a paginated list of events from PostgreSQL. Supports filtering
+        by event_type, source, and timestamp range. `pagination.count` is the
+        number of rows returned in this response, not the total matching DB count.
+      parameters:
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/OffsetParam'
+        - name: event_type
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by exact event_type value.
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by exact source value.
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: >
+            Lower bound on event timestamp (inclusive). Must be a valid ISO-8601
+            string. Must not be after `to` if both are provided.
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: >
+            Upper bound on event timestamp (inclusive). Must be a valid ISO-8601
+            string. Must not be before `from` if both are provided.
+      responses:
+        "200":
+          description: Paginated list of event records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventListResponse'
+              example:
+                data:
+                  - event_id: 550e8400-e29b-41d4-a716-446655440000
+                    event_type: cpu_spike
+                    source: prod-web-01
+                    timestamp: "2026-02-20T12:00:00.000Z"
+                    payload:
+                      cpu_percent: 95
+                    metadata: {}
+                    created_at: "2026-02-20T12:00:00.123Z"
+                pagination:
+                  limit: 50
+                  offset: 0
+                  count: 1
+        "400":
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              examples:
+                limit_not_integer:
+                  value:
+                    error: limit must be an integer
+                offset_not_integer:
+                  value:
+                    error: offset must be an integer
+                from_invalid:
+                  value:
+                    error: from must be a valid ISO-8601 timestamp
+                to_invalid:
+                  value:
+                    error: to must be a valid ISO-8601 timestamp
+                from_after_to:
+                  value:
+                    error: from must not be after to
+
+  /api/v1/events/batch:
+    post:
+      operationId: ingestEventBatch
+      tags: [Events]
+      summary: Ingest a batch of events
+      description: >
+        Validates all events atomically — if any event fails, the entire batch
+        is rejected (no partial success). Accepted events are enqueued
+        concurrently, fire-and-forget.
+
+        **Minimum batch size:** 1 (enforced by Zod schema).
+
+        **Maximum batch size:** Not enforced in schema or code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatchInput'
+            example:
+              - event_type: cpu_spike
+                source: prod-web-01
+                timestamp: "2026-02-20T12:00:00.000Z"
+                payload:
+                  cpu_percent: 95
+              - event_type: cpu_spike
+                source: prod-web-02
+                timestamp: "2026-02-20T12:00:01.000Z"
+                payload:
+                  cpu_percent: 88
+      responses:
+        "202":
+          description: All events accepted and enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchIngestAccepted'
+              example:
+                status: accepted
+                count: 2
+                event_ids:
+                  - 550e8400-e29b-41d4-a716-446655440001
+                  - 550e8400-e29b-41d4-a716-446655440002
+        "400":
+          description: >
+            Batch validation failed. Entire batch rejected.
+            `path` may contain array indices for per-item errors.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationErrorResponse'
+              example:
+                error: Validation failed
+                issues:
+                  - code: too_small
+                    minimum: 1
+                    type: array
+                    path: []
+                    message: Batch must contain at least one event
+
+  /api/v1/events/health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Service health check
+      description: >
+        Pings Redis and reads the `worker:health` key set by the background
+        worker process (with a 120-second TTL). Returns worker status as
+        `"ok"`, `"degraded"`, or `"unknown"`.
+
+        **Route priority:** This static path takes precedence over
+        `GET /api/v1/events/{event_id}` in Fastify's router.
+      responses:
+        "200":
+          description: Redis is reachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+                redis: PONG
+                worker: ok
+        "503":
+          description: Redis is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthDegradedResponse'
+              example:
+                status: degraded
+                redis: unreachable
+                worker: unknown
+
+  /api/v1/events/{event_id}:
+    get:
+      operationId: getEvent
+      tags: [Events]
+      summary: Get a single event by ID
+      description: >
+        Retrieve one event row by its UUID. No UUID format validation is
+        performed on the path parameter — non-UUID strings are passed to
+        the DB query and return 404.
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The event's UUID.
+      responses:
+        "200":
+          description: The event record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventRecord'
+              example:
+                event_id: 550e8400-e29b-41d4-a716-446655440000
+                event_type: cpu_spike
+                source: prod-web-01
+                timestamp: "2026-02-20T12:00:00.000Z"
+                payload:
+                  cpu_percent: 95
+                metadata: {}
+                created_at: "2026-02-20T12:00:00.123Z"
+        "404":
+          description: Event not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: Event not found
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Anomalies
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /api/v1/anomalies:
+    get:
+      operationId: listAnomalies
+      tags: [Anomalies]
+      summary: List anomalies (paginated + filtered)
+      description: >
+        Returns a paginated list of detected anomalies from PostgreSQL.
+        `pagination.count` is the number of rows returned, not the total
+        matching DB count.
+      parameters:
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/OffsetParam'
+        - name: rule_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by exact rule_id value.
+        - name: severity
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by exact severity value (e.g. "warning", "critical").
+      responses:
+        "200":
+          description: Paginated list of anomaly records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnomalyListResponse'
+              example:
+                data:
+                  - anomaly_id: 661e8400-e29b-41d4-a716-446655440000
+                    event_id: 550e8400-e29b-41d4-a716-446655440000
+                    rule_id: zscore-count-spike
+                    severity: warning
+                    message: "Z-score spike detected: z=2.24, current=30, mean=3, stddev=0.89, bucketSeconds=10, bucketStart=2026-02-20T00:15:00.000Z"
+                    detected_at: "2026-02-20T00:15:05.123Z"
+                pagination:
+                  limit: 50
+                  offset: 0
+                  count: 1
+        "400":
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              examples:
+                limit_not_integer:
+                  value:
+                    error: limit must be an integer
+                offset_not_integer:
+                  value:
+                    error: offset must be an integer
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Rules
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /api/v1/rules:
+    post:
+      operationId: createRule
+      tags: [Rules]
+      summary: Create a threshold rule
+      description: >
+        Creates a new rule and publishes a `rules_changed` Pub/Sub notification
+        so the worker hot-reloads immediately. `enabled` defaults to `true`;
+        `cooldown_seconds` defaults to `0`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuleInput'
+            example:
+              name: High error rate
+              severity: critical
+              window_seconds: 60
+              cooldown_seconds: 300
+              condition:
+                type: threshold
+                metric: count
+                filters:
+                  event_type: error
+                  source: payment_service
+                operator: ">"
+                value: 5
+      responses:
+        "201":
+          description: Rule created. Returns the full rule record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleRecord'
+              example:
+                rule_id: 772e8400-e29b-41d4-a716-446655440000
+                name: High error rate
+                enabled: true
+                severity: critical
+                window_seconds: 60
+                cooldown_seconds: 300
+                condition:
+                  type: threshold
+                  metric: count
+                  filters:
+                    event_type: error
+                    source: payment_service
+                  operator: ">"
+                  value: 5
+                created_at: "2026-02-20T12:00:00.000Z"
+                updated_at: "2026-02-20T12:00:00.000Z"
+        "400":
+          description: Request body failed Zod validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZodFlattenedErrorResponse'
+              example:
+                error:
+                  formErrors: []
+                  fieldErrors:
+                    severity:
+                      - "Invalid enum value. Expected 'critical' | 'warning' | 'info', received 'high'"
+
+    get:
+      operationId: listRules
+      tags: [Rules]
+      summary: List all rules
+      description: Returns all rules (both enabled and disabled) as an array.
+      responses:
+        "200":
+          description: Array of all rule records. Empty array if none exist.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RuleRecord'
+              example:
+                - rule_id: 772e8400-e29b-41d4-a716-446655440000
+                  name: High error rate
+                  enabled: true
+                  severity: critical
+                  window_seconds: 60
+                  cooldown_seconds: 300
+                  condition:
+                    type: threshold
+                    metric: count
+                    filters:
+                      event_type: error
+                      source: payment_service
+                    operator: ">"
+                    value: 5
+                  created_at: "2026-02-20T12:00:00.000Z"
+                  updated_at: "2026-02-20T12:00:00.000Z"
+
+  /api/v1/rules/{rule_id}:
+    get:
+      operationId: getRule
+      tags: [Rules]
+      summary: Get a rule by ID
+      description: >
+        Retrieves a single rule. `rule_id` is validated against a UUID regex
+        before the DB query.
+      parameters:
+        - $ref: '#/components/parameters/RuleIdParam'
+      responses:
+        "200":
+          description: The rule record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleRecord'
+        "400":
+          description: rule_id is not a valid UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: rule_id must be a valid UUID
+        "404":
+          description: Rule not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: Rule not found
+
+    put:
+      operationId: replaceRule
+      tags: [Rules]
+      summary: Fully replace a rule
+      description: >
+        Full replace — all fields in the request body are required. Unlike
+        POST, `enabled` and `cooldown_seconds` have no defaults and must be
+        explicitly provided. Publishes a `rules_changed` Pub/Sub notification
+        on success.
+      parameters:
+        - $ref: '#/components/parameters/RuleIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRuleInput'
+            example:
+              name: Updated rule
+              enabled: true
+              severity: warning
+              window_seconds: 120
+              cooldown_seconds: 60
+              condition:
+                type: threshold
+                metric: count
+                filters:
+                  event_type: error
+                operator: ">="
+                value: 3
+      responses:
+        "200":
+          description: Updated rule record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleRecord'
+        "400":
+          description: Invalid UUID in path or body validation failure.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SimpleErrorResponse'
+                  - $ref: '#/components/schemas/ZodFlattenedErrorResponse'
+              examples:
+                invalid_uuid:
+                  value:
+                    error: rule_id must be a valid UUID
+                body_invalid:
+                  value:
+                    error:
+                      formErrors: []
+                      fieldErrors:
+                        name: [Required]
+        "404":
+          description: Rule not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: Rule not found
+
+    patch:
+      operationId: patchRule
+      tags: [Rules]
+      summary: Partially update a rule
+      description: >
+        All body fields are optional, but at least one must be provided.
+        An empty body `{}` returns a 400 with a formErrors message.
+        Publishes a `rules_changed` Pub/Sub notification on success.
+      parameters:
+        - $ref: '#/components/parameters/RuleIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchRuleInput'
+            example:
+              enabled: false
+      responses:
+        "200":
+          description: Updated rule record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleRecord'
+        "400":
+          description: >
+            Invalid UUID in path, empty body, or field validation failure.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SimpleErrorResponse'
+                  - $ref: '#/components/schemas/ZodFlattenedErrorResponse'
+              examples:
+                invalid_uuid:
+                  value:
+                    error: rule_id must be a valid UUID
+                empty_body:
+                  value:
+                    error:
+                      formErrors: [At least one field must be provided]
+                      fieldErrors: {}
+        "404":
+          description: Rule not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: Rule not found
+
+    delete:
+      operationId: deleteRule
+      tags: [Rules]
+      summary: Delete a rule
+      description: >
+        Permanently deletes the rule. Publishes a `rules_changed` Pub/Sub
+        notification on success. Returns 204 with no response body.
+      parameters:
+        - $ref: '#/components/parameters/RuleIdParam'
+      responses:
+        "204":
+          description: Rule deleted. No response body.
+        "400":
+          description: rule_id is not a valid UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: rule_id must be a valid UUID
+        "404":
+          description: Rule not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              example:
+                error: Rule not found
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Metrics
+  # ─────────────────────────────────────────────────────────────────────────
+
+  /api/v1/metrics:
+    get:
+      operationId: getMetrics
+      tags: [Metrics]
+      summary: Get aggregated event metrics
+      description: >
+        Returns event counts and per-second rates grouped by `event_type` or
+        `source` within a sliding time window. Queries only the `events` table.
+        The window end is server `now()` at query time.
+      parameters:
+        - name: window_seconds
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 10
+            maximum: 3600
+            default: 60
+          description: >
+            Time window size in seconds. Must be a valid integer between 10
+            and 3600 inclusive. Default: 60.
+        - name: group_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [event_type, source]
+            default: event_type
+          description: "Column to group counts by. Default: event_type."
+        - name: event_type
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Pre-filter — only count events with this event_type.
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Pre-filter — only count events with this source.
+      responses:
+        "200":
+          description: Aggregated metrics result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResult'
+              example:
+                window_seconds: 300
+                group_by: source
+                from: "2026-02-20T11:55:00.000Z"
+                to: "2026-02-20T12:00:00.000Z"
+                metrics:
+                  - key: payment_service
+                    count: 42
+                    rate_per_sec: 0.14
+                  - key: auth_service
+                    count: 7
+                    rate_per_sec: 0.0233
+        "400":
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleErrorResponse'
+              examples:
+                not_integer:
+                  value:
+                    error: window_seconds must be an integer
+                out_of_range:
+                  value:
+                    error: window_seconds must be between 10 and 3600
+                bad_group_by:
+                  value:
+                    error: "group_by must be one of: event_type, source"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Components
+# ─────────────────────────────────────────────────────────────────────────────
+
+components:
+
+  parameters:
+
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+      description: >
+        Maximum results per page. Must be a valid integer.
+        Clamped to [1, 500]. Default: 50.
+
+    OffsetParam:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+      description: Row offset for pagination. Must be a valid integer. Floored to 0.
+
+    RuleIdParam:
+      name: rule_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: >
+        The rule's UUID. Validated against UUID regex in the handler before
+        any DB query.
+
+  schemas:
+
+    # ── Event input / ingestion ───────────────────────────────────────────
+
+    EventInput:
+      type: object
+      description: >
+        Request body for single event ingestion. Validated by Zod `eventSchema`.
+      required:
+        - event_type
+        - source
+        - timestamp
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: >
+            Optional. If omitted, the server assigns a UUID via
+            `crypto.randomUUID()`.
+        event_type:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Event category (e.g. "page_view", "error", "cpu_spike").
+        source:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Originating system or service.
+        timestamp:
+          type: string
+          format: date-time
+          description: Event occurrence time. Must be a valid ISO-8601 datetime.
+        payload:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: Event-specific data. Any JSON object.
+        metadata:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: Routing / tracing context. Any JSON object.
+
+    EventBatchInput:
+      type: array
+      description: >
+        Array of event objects for batch ingestion. Minimum 1 item.
+        No maximum enforced in schema or code.
+      minItems: 1
+      items:
+        $ref: '#/components/schemas/EventInput'
+
+    # ── Event record (DB row) ─────────────────────────────────────────────
+
+    EventRecord:
+      type: object
+      description: >
+        Full event row as returned from PostgreSQL (includes `created_at`).
+      required:
+        - event_id
+        - event_type
+        - source
+        - timestamp
+        - payload
+        - metadata
+        - created_at
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+        source:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+          description: Event occurrence time (timestamptz, serialized as ISO-8601).
+        payload:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+          description: Row insertion timestamp (timestamptz, serialized as ISO-8601).
+
+    # ── Anomaly record (DB row) ───────────────────────────────────────────
+
+    AnomalyRecord:
+      type: object
+      description: Anomaly row as returned from PostgreSQL.
+      required:
+        - anomaly_id
+        - event_id
+        - rule_id
+        - severity
+        - message
+        - detected_at
+      properties:
+        anomaly_id:
+          type: string
+          format: uuid
+          description: Primary key (server-generated UUID).
+        event_id:
+          type: string
+          format: uuid
+          description: Triggering event ID (not a FK constraint in DB).
+        rule_id:
+          type: string
+          description: Identifier of the rule or statistical profile that fired.
+        severity:
+          type: string
+          description: >
+            Anomaly severity. For threshold rules: "critical", "warning", or "info".
+            For statistical evaluator: uses the evaluator-level severity setting.
+        message:
+          type: string
+          maxLength: 1024
+          description: Human-readable anomaly description.
+        detected_at:
+          type: string
+          format: date-time
+          description: When the anomaly was detected (timestamptz, serialized as ISO-8601).
+
+    # ── Rule schemas ──────────────────────────────────────────────────────
+
+    ThresholdCondition:
+      type: object
+      description: >
+        Threshold condition stored as JSONB in the rules table.
+        Only `type: "threshold"` and `metric: "count"` are supported.
+      required:
+        - type
+        - metric
+        - operator
+        - value
+      properties:
+        type:
+          type: string
+          enum: [threshold]
+          description: Always "threshold".
+        metric:
+          type: string
+          enum: [count]
+          description: Always "count".
+        operator:
+          type: string
+          enum: [">", ">=", "<", "<=", "==", "!="]
+          description: Comparison operator applied to the event count.
+        value:
+          type: number
+          description: Threshold value. Must be a finite number.
+        filters:
+          type: object
+          description: Optional event filters applied before counting.
+          properties:
+            event_type:
+              type: string
+              minLength: 1
+              description: Only count events with this event_type.
+            source:
+              type: string
+              minLength: 1
+              description: Only count events with this source.
+
+    CreateRuleInput:
+      type: object
+      description: >
+        Request body for POST /api/v1/rules. Validated by Zod `createRuleSchema`.
+        `enabled` defaults to true; `cooldown_seconds` defaults to 0.
+      required:
+        - name
+        - severity
+        - window_seconds
+        - condition
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        enabled:
+          type: boolean
+          default: true
+          description: Whether the rule is active. Defaults to true.
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        window_seconds:
+          type: integer
+          minimum: 1
+          description: Sliding evaluation window in seconds.
+        cooldown_seconds:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Minimum seconds between anomaly firings. Defaults to 0 (no cooldown).
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+
+    UpdateRuleInput:
+      type: object
+      description: >
+        Request body for PUT /api/v1/rules/:rule_id (full replace).
+        All fields required — no defaults applied.
+      required:
+        - name
+        - enabled
+        - severity
+        - window_seconds
+        - cooldown_seconds
+        - condition
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        enabled:
+          type: boolean
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        window_seconds:
+          type: integer
+          minimum: 1
+        cooldown_seconds:
+          type: integer
+          minimum: 0
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+
+    PatchRuleInput:
+      type: object
+      description: >
+        Request body for PATCH /api/v1/rules/:rule_id (partial update).
+        All fields optional, but at least one must be provided (Zod refine check).
+        An empty object `{}` is rejected with a 400.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        enabled:
+          type: boolean
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        window_seconds:
+          type: integer
+          minimum: 1
+        cooldown_seconds:
+          type: integer
+          minimum: 0
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+
+    RuleRecord:
+      type: object
+      description: Full rule row as returned from PostgreSQL.
+      required:
+        - rule_id
+        - name
+        - enabled
+        - severity
+        - window_seconds
+        - cooldown_seconds
+        - condition
+        - created_at
+        - updated_at
+      properties:
+        rule_id:
+          type: string
+          format: uuid
+          description: Primary key (server-generated UUID).
+        name:
+          type: string
+        enabled:
+          type: boolean
+        severity:
+          type: string
+          enum: [critical, warning, info]
+        window_seconds:
+          type: integer
+        cooldown_seconds:
+          type: integer
+        condition:
+          $ref: '#/components/schemas/ThresholdCondition'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # ── Metrics ───────────────────────────────────────────────────────────
+
+    MetricsBucket:
+      type: object
+      required:
+        - key
+        - count
+        - rate_per_sec
+      properties:
+        key:
+          type: string
+          description: The group-by column value (e.g. event_type or source name).
+        count:
+          type: integer
+          description: Total event count in the window.
+        rate_per_sec:
+          type: number
+          description: count / window_seconds, rounded to 4 decimal places.
+
+    MetricsResult:
+      type: object
+      required:
+        - window_seconds
+        - group_by
+        - from
+        - to
+        - metrics
+      properties:
+        window_seconds:
+          type: integer
+          description: Effective window size used.
+        group_by:
+          type: string
+          enum: [event_type, source]
+          description: Effective group-by column used.
+        from:
+          type: string
+          format: date-time
+          description: Window start timestamp (server now() minus window_seconds).
+        to:
+          type: string
+          format: date-time
+          description: Window end timestamp (server now() at query time).
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricsBucket'
+
+    # ── Health ────────────────────────────────────────────────────────────
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - redis
+        - worker
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: Always "ok" on 200.
+        redis:
+          type: string
+          description: Redis PING response — "PONG" on success.
+        worker:
+          type: string
+          enum: [ok, degraded, unknown]
+          description: >
+            Worker health: "ok"/"degraded" from Redis key `worker:health`;
+            "unknown" if key is absent or Redis read fails.
+
+    HealthDegradedResponse:
+      type: object
+      required:
+        - status
+        - redis
+        - worker
+      properties:
+        status:
+          type: string
+          enum: [degraded]
+        redis:
+          type: string
+          enum: [unreachable]
+        worker:
+          type: string
+          enum: [unknown]
+
+    # ── Ingestion response envelopes ──────────────────────────────────────
+
+    IngestAccepted:
+      type: object
+      required:
+        - status
+        - event_id
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+        event_id:
+          type: string
+          format: uuid
+          description: Server-assigned or caller-supplied event UUID.
+
+    BatchIngestAccepted:
+      type: object
+      required:
+        - status
+        - count
+        - event_ids
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+        count:
+          type: integer
+          description: Number of events in the accepted batch.
+        event_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: >
+            Assigned or echoed UUIDs in the same order as the input array.
+
+    # ── Paginated list response envelopes ─────────────────────────────────
+
+    Pagination:
+      type: object
+      required:
+        - limit
+        - offset
+        - count
+      properties:
+        limit:
+          type: integer
+          description: Effective limit applied (after clamping to [1, 500]).
+        offset:
+          type: integer
+          description: Effective offset applied.
+        count:
+          type: integer
+          description: >
+            Number of records returned in `data`. Not the total matching
+            DB count.
+
+    EventListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventRecord'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    AnomalyListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnomalyRecord'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # ── Error responses ───────────────────────────────────────────────────
+
+    SimpleErrorResponse:
+      type: object
+      description: >
+        Simple string error used for query/path parameter validation failures
+        and rule UUID check failures.
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+
+    ValidationErrorResponse:
+      type: object
+      description: >
+        Used by POST /api/v1/events and POST /api/v1/events/batch.
+        Contains the raw Zod issues array.
+      required:
+        - error
+        - issues
+      properties:
+        error:
+          type: string
+          enum: [Validation failed]
+        issues:
+          type: array
+          description: Array of Zod ZodIssue objects.
+          items:
+            type: object
+            additionalProperties: true
+
+    ZodFlattenedErrorResponse:
+      type: object
+      description: >
+        Used by POST /api/v1/rules, PUT /api/v1/rules/:id, PATCH /api/v1/rules/:id.
+        Contains the output of Zod's `error.flatten()`.
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - formErrors
+            - fieldErrors
+          properties:
+            formErrors:
+              type: array
+              items:
+                type: string
+              description: Top-level (non-field) validation errors.
+            fieldErrors:
+              type: object
+              additionalProperties:
+                type: array
+                items:
+                  type: string
+              description: Per-field validation error arrays keyed by field name.

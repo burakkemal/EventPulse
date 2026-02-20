@@ -50,13 +50,11 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    command : ["sh", "-c", "npm run build:frontend && npm run dev"]
+    command: ["sh", "-c", "npm run build:frontend && npm run dev"]
     volumes:
-      # Full repo mount — makes tests, configs, docs visible inside container
       - .:/app
-      # Named volume masks host node_modules, preserves container's npm install
       - app_node_modules:/app/node_modules
-      - dashboard_dist:/app/public/dist   # 👈 build çıktısını korur
+      - dashboard_dist:/app/public/dist
 
   worker:
     build:
@@ -77,9 +75,29 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      # Same strategy as app — full repo + preserved node_modules
       - .:/app
       - worker_node_modules:/app/node_modules
+
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.17.14
+    container_name: eventpulse-swagger
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      # Serve the spec from nginx's static root so the browser fetches it from
+      # the same origin (http://localhost:8081/swagger.yaml) — no CORS issues.
+      - ./docs/swagger.yaml:/usr/share/nginx/html/swagger.yaml:ro
+      # Do NOT mount swagger-initializer.js here. swaggerapi/swagger-ui v5.x
+      # runs /usr/share/nginx/configurator/index.js (Node.js) at startup and
+      # unconditionally calls fs.writeFileSync on swagger-initializer.js.
+      # A :ro bind-mount causes EROFS.  Instead we leave the internal copy
+      # writable and let the configurator rewrite it via the URL env var below.
+    environment:
+      # Tells the v5.x Node.js configurator to set url: "/swagger.yaml" inside
+      # swagger-initializer.js.  The spec is served by nginx from the same
+      # origin (mount above) so no CORS issues arise.
+      URL: /swagger.yaml
 
 volumes:
   pgdata:

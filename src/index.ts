@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, join, extname } from 'node:path';
 
@@ -108,7 +109,10 @@ async function main(): Promise<void> {
   await fastify.register(queryRoutes);
   await fastify.register(ruleRoutes);
   await fastify.register(metricsRoutes);
-
+await fastify.register(cors, {
+  origin: ['http://localhost:8081'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+});
   // --------------------------------------------------
   // Notification infra placeholders
   // --------------------------------------------------
