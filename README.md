@@ -106,6 +106,21 @@ All tests passing Coverage >80%
 (Current ~90%+)
 
 ------------------------------------------------------------------------
+### Seed data (scripts/)
+
+This repo includes a single seed / smoke script that exercises **all** HTTP APIs:
+- Single event ingest (`POST /api/v1/events`)
+- Batch ingest (`POST /api/v1/events/batch`)
+- Fetch persisted event (`GET /api/v1/events/:event_id`) — waits for worker persistence
+- Create rule (`POST /api/v1/rules`)
+- Trigger anomaly (threshold breach) + query anomalies (`GET /api/v1/anomalies`)
+- Query metrics (`GET /api/v1/metrics`)
+- List events (`GET /api/v1/events`)
+- List rules (`GET /api/v1/rules`)
+
+**Run (inside Docker container):**
+---bash
+docker exec eventpulse-app node scripts/seed_all_apis.mjs
 
 # Event Ingestion Example
 
