@@ -10,13 +10,23 @@ reviewer onboarding.
 
 # Quick Start (≤5 Commands)
 
-git clone https://github.com/burakkemal/EventPulse cd EventPulse cp
-.env.example .env docker compose up -d –build curl
-http://localhost:3000/api/v1/events/health
+``` bash
+git clone https://github.com/burakkemal/EventPulse
+cd EventPulse
+cp .env.example .env
+docker compose up -d --build
+curl http://localhost:3000/api/v1/events/health
+```
 
 Expected:
 
-{ “status”: “ok”, “redis”: “PONG”, “worker”: “ok” }
+``` json
+{
+  "status": "ok",
+  "redis": "PONG",
+  "worker": "ok"
+}
+```
 
 ------------------------------------------------------------------------
 
@@ -24,35 +34,32 @@ Expected:
 
 High-level data flow:
 
-Client ↓ Fastify API ↓ Redis Streams (Queue) ↓ Worker Service ↓
-PostgreSQL (Persistence) ↓ Rule Engine ↓ Notifications (WebSocket /
+Client → Fastify API → Redis Streams (Queue) → Worker Service →
+PostgreSQL (Persistence) → Rule Engine → Notifications (WebSocket /
 Slack / Email)
 
-API handles ingestion only.
-
-Worker performs persistence and rule evaluation.
+-   API handles ingestion only.
+-   Worker performs persistence and rule evaluation.
 
 Architecture details:
 
+``` bash
 docs/architecture.md
+```
 
 ------------------------------------------------------------------------
 
 # Technology Choices
 
-Fastify: Chosen for high throughput and low overhead HTTP handling with
-strong TypeScript support.
-
-Redis Streams: Used for ordered delivery, consumer groups, replay
-capability, and crash recovery.
-
-PostgreSQL: Primary source of truth with strong consistency guarantees
-and JSONB payload flexibility.
-
-Worker Separation: Prevents database latency or rule execution delays
-from impacting API ingestion latency.
-
-Docker Compose: Provides reproducible local environments for reviewers.
+-   **Fastify** --- high throughput HTTP handling with strong TypeScript
+    support.
+-   **Redis Streams** --- ordered delivery, consumer groups, replay
+    capability.
+-   **PostgreSQL** --- primary source of truth using JSONB payload
+    flexibility.
+-   **Worker Separation** --- prevents rule execution or DB latency
+    impacting ingestion.
+-   **Docker Compose** --- reproducible reviewer environment.
 
 ------------------------------------------------------------------------
 
@@ -61,83 +68,115 @@ Docker Compose: Provides reproducible local environments for reviewers.
 Install:
 
 -   Docker Desktop
--   Node.js 22+ (optional)
 -   Git
+-   Node.js 22+ (optional)
 
 Verify:
 
-docker –version docker compose version
+``` bash
+docker --version
+docker compose version
+```
 
 ------------------------------------------------------------------------
 
-Running the System
+# Running the System
 
-docker compose up -d –build
+``` bash
+docker compose up -d --build
+```
 
 Verify services:
 
+``` bash
 docker compose ps
+```
 
 Expected:
 
-eventpulse-db healthy eventpulse-redis healthy eventpulse-app running
-eventpulse-worker running
+-   eventpulse-db healthy
+-   eventpulse-redis healthy
+-   eventpulse-app running
+-   eventpulse-worker running
 
 ------------------------------------------------------------------------
 
 # Health Check
 
+``` bash
 curl http://localhost:3000/api/v1/events/health
+```
 
 ------------------------------------------------------------------------
 
 # Running Tests
 
+``` bash
 docker exec eventpulse-app npm test
+```
 
 Coverage:
 
+``` bash
 docker exec eventpulse-app npm run test:coverage
+```
 
 Expected:
 
-All tests passing Coverage >80%
-
-(Current ~90%+)
+-   All tests passing
+-   Coverage \> 80% (current \~90%+)
 
 ------------------------------------------------------------------------
-### Seed data (scripts/)
 
-This repo includes a single seed / smoke script that exercises **all** HTTP APIs:
-- Single event ingest (`POST /api/v1/events`)
-- Batch ingest (`POST /api/v1/events/batch`)
-- Fetch persisted event (`GET /api/v1/events/:event_id`) — waits for worker persistence
-- Create rule (`POST /api/v1/rules`)
-- Trigger anomaly (threshold breach) + query anomalies (`GET /api/v1/anomalies`)
-- Query metrics (`GET /api/v1/metrics`)
-- List events (`GET /api/v1/events`)
-- List rules (`GET /api/v1/rules`)
+## Seed Data (scripts/)
 
-**Run (inside Docker container):**
----bash
+This repository includes a seed / smoke script exercising all HTTP APIs:
+
+-   Single ingest
+-   Batch ingest
+-   Event fetch
+-   Rule creation
+-   Threshold anomaly trigger
+-   Metrics query
+-   Events listing
+
+Run inside container:
+
+``` bash
 docker exec eventpulse-app node scripts/seed_all_apis.mjs
+```
+
+------------------------------------------------------------------------
 
 # Event Ingestion Example
 
-curl -X POST http://localhost:3000/api/v1/events -H “Content-Type:
-application/json” -d ‘{ “event_type”:“page_view”, “source”:“web”,
-“timestamp”:“2026-02-20T12:00:00Z”, “payload”:{“url”:“/home”},
-“metadata”:{} }’
+``` bash
+curl -X POST http://localhost:3000/api/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type":"page_view",
+    "source":"web",
+    "timestamp":"2026-02-20T12:00:00Z",
+    "payload":{"url":"/home"},
+    "metadata":{}
+  }'
+```
 
 Response:
 
+``` text
 202 Accepted
+```
 
 ------------------------------------------------------------------------
 
-Dashboard
+# Dashboard
 
+Open:
+
+``` text
 http://localhost:3000/dashboard
+```
 
 Provides:
 
@@ -148,47 +187,60 @@ Provides:
 
 ------------------------------------------------------------------------
 
+## Rule Engine Verification (Quick Test)
+
+To verify end‑to‑end rule evaluation:
+
+``` text
+docs/rule-engine-runtime-test.md
+```
+
+Follow the guide to validate anomaly triggering within seconds.
+
+------------------------------------------------------------------------
+
 # Notifications
 
 Channels:
 
 -   WebSocket (enabled)
 -   Slack (optional webhook)
--   Email (stub implementation)
+-   Email (stub)
 
 Configuration:
 
+``` bash
 config/notifications.yaml
+```
 
 ------------------------------------------------------------------------
 
 # Known Limitations
 
--   Authentication and RBAC are not implemented (out of scope).
--   Email notification channel is a stub implementation.
--   Notification configuration stored in YAML instead of database.
--   Automatic table creation used for local development instead of
-    production migrations.
+-   Authentication / RBAC not implemented (out of scope).
+-   Email notifications are stubbed.
+-   Notification config stored in YAML.
+-   Automatic table creation used for local development.
 
-# Future Improvements:
+Future Improvements:
 
--   Database-backed configuration.
--   Authentication layer.
--   Horizontal worker autoscaling.
+-   Database-backed configuration
+-   Authentication layer
+-   Horizontal worker autoscaling
 
 ------------------------------------------------------------------------
 
 # AI Tools Used
 
-ChatGPT GPT-5.2: Architecture discussion, documentation refinement,
-debugging assistance.
-
-Claude 4.6 Sonnet: Code generation, debugging, and implementation
-assistance.
+-   ChatGPT GPT‑5.2 --- architecture discussion and documentation
+    refinement.
+-   Claude Sonnet --- code generation and debugging.
 
 Detailed audit log:
 
+``` bash
 docs/ai-log.md
+```
 
 ------------------------------------------------------------------------
 
@@ -196,21 +248,29 @@ docs/ai-log.md
 
 API:
 
+``` bash
 docker logs eventpulse-app
+```
 
 Worker:
 
+``` bash
 docker logs eventpulse-worker
+```
 
 ------------------------------------------------------------------------
 
 # Stop Services
 
+``` bash
 docker compose down
+```
 
 Remove volumes:
 
+``` bash
 docker compose down -v
+```
 
 ------------------------------------------------------------------------
 
@@ -218,14 +278,21 @@ docker compose down -v
 
 Architecture:
 
+``` bash
 docs/architecture.md
+```
 
 AI Interaction Log:
 
+``` bash
 docs/ai-log.md
+```
 
-Swagger : 
-Interactive API specification is available via docs/swagger.yaml.
+Swagger:
+
+``` bash
+docs/swagger.yaml
+```
 
 ------------------------------------------------------------------------
 
